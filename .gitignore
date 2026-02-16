@@ -1,0 +1,29 @@
+# Virtual Environment
+.venv
+
+# Python
+__pycache__
+.ipynb_checkpoints
+tempCodeRunnerFile.py
+
+# Environment Variables
+.env
+
+# Logs
+logs/
+
+# IDE and Editor Settings
+.vscode/
+
+# Test and Development Files
+test.py
+test_text.py
+directory_tree.py
+
+# Source Directories
+src/
+src2/
+
+# Miscellaneous
+Archive/
+depth/
