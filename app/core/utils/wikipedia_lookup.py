@@ -9,8 +9,22 @@ from langchain_core.messages import HumanMessage, SystemMessage # For LLM prompt
 
 logger = logging.getLogger(__name__)
 
+# Shared User-Agent. Wikimedia rejects requests with generic/default User-Agents
+# (returning an HTML error page that breaks JSON parsing), so we must set a
+# descriptive one with a real contact on BOTH wikipedia and wikipedia-api.
+WIKI_USER_AGENT = 'KNIGHT/1.0 (Contact: gaialr2001@gmail.com)'
+
+# The `wikipedia` library (used for search/page) keeps its own default User-Agent,
+# so set it explicitly. Also throttle to stay within Wikimedia rate limits.
+try:
+    wikipedia.set_user_agent(WIKI_USER_AGENT)
+except AttributeError:
+    # Older/newer variants may not expose set_user_agent; patch the module global.
+    wikipedia.wikipedia.USER_AGENT = WIKI_USER_AGENT
+wikipedia.set_rate_limiting(True)
+
 # Initialize wikipedia-api object
-wiki_api = wikipediaapi.Wikipedia(user_agent='KNIGHT/1.0 (Contact: your_email@example.com)', language='en')
+wiki_api = wikipediaapi.Wikipedia(user_agent=WIKI_USER_AGENT, language='en')
 
 # Initialize Text Splitter
 text_splitter = RecursiveCharacterTextSplitter(
