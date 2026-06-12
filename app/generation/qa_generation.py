@@ -1,7 +1,6 @@
 # app/generation/qa_generation.py
 
 import logging
-import json
 import time # Import time module
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import functools
@@ -12,113 +11,73 @@ from langchain_core.messages import SystemMessage, HumanMessage # <-- Ensure imp
 
 logger = logging.getLogger(__name__)
 
-# --- System Prompts for MCQ Generation ---
-SYSTEM_PROMPT_QA_FORWARD = """You are a structured question generation system. Your task is to generate a question and a concise answer based on a multi-hop path in a knowledge graph and node descriptions. 
-The question must reflect reasoning over the multi-step relationships in the path. 
-The answer should be clearly implied by the path and descriptions, often referring to a specific node."""
+# --- System Prompts for open-ended QA generation ---
+SYSTEM_PROMPT_QA_FORWARD = """You are a structured question generation system. Your task is to generate an open-ended question and a concise, free-form answer based on a multi-hop path in a knowledge graph and node descriptions.
+The question must reflect reasoning over the multi-step relationships in the path.
+The answer must be a short free-form phrase clearly implied by the path and descriptions, typically referring to a specific node. Do NOT produce multiple-choice options."""
 
 SYSTEM_PROMPT_QA_REVERSE = """You are a reasoning assistant generating reverse questions from knowledge graph paths. 
 Your task is to generate a question that can be answered explicitly by the start node of a multi-hop path. 
 Use the end node's perspective when possible to guide the reasoning backward."""
 
-# --- System Prompt for MCQ Validation ---
-SYSTEM_PROMPT_MCQ_VALIDATION = '''You are a rigorous MCQ-validation assistant.
+# --- System Prompt for open-ended QA validation ---
+SYSTEM_PROMPT_QA_VALIDATION = '''You are a rigorous open-ended QA-validation assistant.
 
 TASK
-Evaluate a four-option multiple-choice question (MCQ) using **only** the information supplied in the "Source Information" block.
-Answer with six YES/NO (or N/A) tags—one per line—in the exact order and casing shown below.
+Evaluate an open-ended question and its concise free-form answer using **only** the information supplied in the "Source Information" block.
+Answer with four YES/NO (or N/A) tags-one per line-in the exact order and casing shown below.
 
 CHECKLIST
-1. GRAMMAR_FLUENCY        Is the Question spelled and phrased correctly and clearly?
-2. SINGLE_CORRECT_KEY      Is exactly one option marked as correct?
-3. OPTION_UNIQUENESS       Are all four options distinct (no duplicates or near-duplicates)?
-4. ANSWERABLE_FROM_SOURCE  Does the indicated correct option follow solely from the Source (path, node excerpts) without outside knowledge?
-5. TOPIC_RELEVANCE         If a Topic is provided, is the MCQ clearly about that topic?
-6. ETHICS_PRIVACY_SAFE     Does the MCQ respect ethical standards and privacy? (No hateful, disallowed, or personal-data content.)
+1. GRAMMAR_FLUENCY         Is the Question spelled and phrased correctly and clearly?
+2. ANSWERABLE_FROM_SOURCE  Does the Answer follow solely from the Source (path, node excerpts) without outside knowledge?
+3. TOPIC_RELEVANCE         If a Topic is provided, is the question clearly about that topic?
+4. ETHICS_PRIVACY_SAFE     Does the question respect ethical standards and privacy? (No hateful, disallowed, or personal-data content.)
 
 STRICT OUTPUT FORMAT
-Grammar_Fluency: [YES/NO]  
-Single_Correct_Key: [YES/NO]  
-Option_Uniqueness: [YES/NO]  
-Answerable_From_Source: [YES/NO]  
-Topic_Relevant: [YES/NO or N/A]  
-Ethics_Privacy_Safe: [YES/NO]  
+Grammar_Fluency: [YES/NO]
+Answerable_From_Source: [YES/NO]
+Topic_Relevant: [YES/NO or N/A]
+Ethics_Privacy_Safe: [YES/NO]
 
-Return **nothing else**—no explanations.
+Return **nothing else**-no explanations.
 
-––––––––––––––––––––––––––––––––––––––––
+----------------------------------------
 FEW-SHOT EXAMPLES  (for internal guidance only)
-––––––––––––––––––––––––––––––––––––––––
+----------------------------------------
 
-► EXAMPLE 1 – All criteria satisfied
+EXAMPLE 1 - All criteria satisfied
 User Input
-Question: In photosynthesis, which component supplies the energy that powers chloroplast reactions?  
-Option A: Oxygen  
-Option B: Sunlight  
-Option C: Carbon dioxide  
-Option D: Chlorophyll  
-Correct Answer Key: B  
-Topic (optional): Photosynthesis  
-Source Information  
-  Path: sunlight → powers → photosynthesis  
-  Start Node 'sunlight' (excerpt): "…electromagnetic radiation from the Sun…"  
-  End   Node 'photosynthesis' (excerpt): "…process by which green plants convert light energy…"  
+Question: In photosynthesis, what supplies the energy that powers chloroplast reactions?
+Answer: Sunlight.
+Topic (optional): Photosynthesis
+Source Information
+  Path: sunlight -> powers -> photosynthesis
+  Start Node 'sunlight' (excerpt): "...electromagnetic radiation from the Sun..."
+  End   Node 'photosynthesis' (excerpt): "...process by which green plants convert light energy..."
 
-Expected Assistant Output  
-Grammar_Fluency: YES  
-Single_Correct_Key: YES  
-Option_Uniqueness: YES  
-Answerable_From_Source: YES  
-Topic_Relevant: YES  
-Ethics_Privacy_Safe: YES  
+Expected Assistant Output
+Grammar_Fluency: YES
+Answerable_From_Source: YES
+Topic_Relevant: YES
+Ethics_Privacy_Safe: YES
 
-────────────────────────────────────────
+----------------------------------------
 
-► EXAMPLE 2 – Duplicate option (fails OPTION_UNIQUENESS)
+EXAMPLE 2 - Answer not supported by the source (fails ANSWERABLE_FROM_SOURCE)
 User Input
-Question: Which gas is released during photosynthesis?  
-Option A: Oxygen  
-Option B: Oxygen  
-Option C: Carbon dioxide  
-Option D: Nitrogen  
-Correct Answer Key: A  
-Topic (optional): Photosynthesis  
-Source Information  
-  Path: photosynthesis → produces → oxygen  
-  Start Node 'photosynthesis' (excerpt): "…process converts CO₂ and water into glucose and releases O₂…"  
-  End   Node 'oxygen' (excerpt): "…a diatomic gas essential for respiration…"
+Question: Which gas is released during photosynthesis?
+Answer: Nitrogen.
+Topic (optional): Photosynthesis
+Source Information
+  Path: photosynthesis -> produces -> oxygen
+  Start Node 'photosynthesis' (excerpt): "...converts CO2 and water into glucose and releases O2..."
+  End   Node 'oxygen' (excerpt): "...a diatomic gas essential for respiration..."
 
-
-Expected Assistant Output  
-Grammar_Fluency: YES  
-Single_Correct_Key: YES  
-Option_Uniqueness: NO  
-Answerable_From_Source: YES  
-Topic_Relevant: YES  
-Ethics_Privacy_Safe: YES  
-
-────────────────────────────────────────
-
-► EXAMPLE 3 – Multiple correct answers (fails SINGLE_CORRECT_KEY & ANSWERABLE_FROM_SOURCE)
-User Input
-Question: Which of the following are noble gases?  
-Option A: Helium  
-Option B: Neon  
-Option C: Argon  
-Option D: Oxygen  
-Correct Answer Key: A  
-Topic (optional): Noble gases  
-Source Information  
-  Path: noble_gases → include → helium, neon, argon  
-  Start Node 'noble_gases' (excerpt): "…group 18 elements known for inertness…"  
-  End   Node 'argon' (excerpt): "…another noble gas element…"  
-
-Expected Assistant Output  
-Grammar_Fluency: YES  
-Single_Correct_Key: NO  
-Option_Uniqueness: YES  
-Answerable_From_Source: NO  
-Topic_Relevant: YES  
+Expected Assistant Output
+Grammar_Fluency: YES
+Answerable_From_Source: NO
+Topic_Relevant: YES
+Ethics_Privacy_Safe: YES
 '''
 
 def generate_qa_from_graph(neo4j_conn, llm_client, max_complexity=2, exact_complexity=None, limit=None, skip_validation=False, validation_sample_rate=1.0, topic: str | None = None, generate_reverse: bool = False):
@@ -195,16 +154,13 @@ def generate_qa_from_graph(neo4j_conn, llm_client, max_complexity=2, exact_compl
         logger.info("No QA pairs generated from paths, skipping validation.")
         print("No QA pairs generated, skipping validation.")
 
-    # --- Save results --- 
-    if validated_qa_pairs:
-        # Add topic to the filename? Or maybe as a field within the json?
-        # Let's keep the filename simple for now.
-        filename = "generated_qa_pairs.json"
-        logger.info(f"Saving {len(validated_qa_pairs)} validated pairs to {filename}...")
-        save_qa_pairs(validated_qa_pairs, filepath=filename) 
-    else:
-        logger.warning("No validated QA pairs generated to save.")
-        print("No validated QA pairs to save.")
+    # --- No save here ---
+    # Persistence is owned by the thesis runner (knight_adapter/runner.py), which
+    # shapes these pairs into the immutable Phase 1 schema and writes the files.
+    # The old save_qa_pairs(...) CWD dump is intentionally removed.
+    if not validated_qa_pairs:
+        logger.warning("No validated QA pairs generated.")
+        print("No validated QA pairs generated.")
 
     # Updated final message
     logger.info(f"Finished QA generation orchestration (Paths). Generated {len(validated_qa_pairs)} validated QA pairs ({complexity_mode}, Limit={limit}{reverse_msg}).")
@@ -273,18 +229,13 @@ MIN_QUESTION_LEN = 10
 MAX_QUESTION_LEN = 200
 MIN_ANSWER_LEN = 1
 
-def _format_combined_validation_prompt(mcq_data: dict, source_type: str, source_details: dict, topic: str | None = None) -> str:
-    """ Creates the human prompt for the new 6-point MCQ validation task. """
-    question_text = mcq_data.get('question', '[Missing Question]')
-    options = mcq_data.get('options', {})
-    option_a = options.get('A', '')
-    option_b = options.get('B', '')
-    option_c = options.get('C', '')
-    option_d = options.get('D', '')
-    correct_answer_key = mcq_data.get('correct_answer_key', '[Missing Key]')
+def _format_combined_validation_prompt(qa_data: dict, source_type: str, source_details: dict, topic: str | None = None) -> str:
+    """ Creates the human prompt for the 4-point open-ended QA validation task. """
+    question_text = qa_data.get('question', '[Missing Question]')
+    answer_text = qa_data.get('answer', '[Missing Answer]')
     topic_or_blank = topic if topic else ""
-    
-    # Extract path and node details (similar to before)
+
+    # Extract path and node details
     nodes_list = source_details.get('nodes', [])
     relationships = source_details.get('relationships', [])
     path_representation = "[Invalid Path Data]"
@@ -300,7 +251,7 @@ def _format_combined_validation_prompt(mcq_data: dict, source_type: str, source_
         start_node_desc = start_node_info.get('description') or "No description available."
         end_node_name = end_node_info.get('name', '?')
         end_node_desc = end_node_info.get('description') or "No description available."
-        
+
         if relationships and len(nodes_list) == len(relationships) + 1:
             path_str_parts = [f"({start_node_name})"]
             for i, rel_type in enumerate(relationships):
@@ -309,88 +260,60 @@ def _format_combined_validation_prompt(mcq_data: dict, source_type: str, source_
             path_representation = "".join(path_str_parts)
         else:
             path_representation = "[Length Mismatch or Missing Relationships]"
-            
-    # Construct the new human prompt
-    prompt = f"""Evaluate the following MCQ based ONLY on the Source Information.
+
+    # Construct the open-ended validation human prompt (question + answer, no options)
+    prompt = f"""Evaluate the following open-ended question and answer based ONLY on the Source Information.
 
 Question: {question_text}
-Option A: {option_a}
-Option B: {option_b}
-Option C: {option_c}
-Option D: {option_d}
-Correct Answer Key: {correct_answer_key}
+Answer: {answer_text}
 Topic (optional): {topic_or_blank}
 
 Source Information
   Path: {path_representation}
-  Start Node '{start_node_name}' (excerpt): {start_node_desc[:150]}…
-  End   Node '{end_node_name}'   (excerpt): {end_node_desc[:150]}…
+  Start Node '{start_node_name}' (excerpt): {start_node_desc[:150]}...
+  End   Node '{end_node_name}'   (excerpt): {end_node_desc[:150]}...
 
-Provide your evaluation in the required six-line format.
+Provide your evaluation in the required four-line format.
 """
-    return prompt.strip() 
+    return prompt.strip()
 
 def parse_combined_validation_response(response_text):
-    """ Parses the new 6-line LLM response for MCQ validation.
-        Returns tuple: (grammar_ok, single_key_ok, uniqueness_ok, answerable_ok, topic_ok, ethics_ok)
+    """ Parses the 4-line LLM response for open-ended QA validation.
+        Returns tuple: (grammar_ok, answerable_ok, topic_ok, ethics_ok)
     """
-    # Defaults
     grammar_ok = False
-    single_key_ok = False
-    uniqueness_ok = False
     answerable_ok = False
-    topic_ok = False # Assume relevant unless explicitly N/A or NO
+    topic_ok = False
     ethics_ok = False
 
     if not response_text:
         logger.warning("Received empty response text for validation parsing.")
-        return grammar_ok, single_key_ok, uniqueness_ok, answerable_ok, topic_ok, ethics_ok
+        return grammar_ok, answerable_ok, topic_ok, ethics_ok
 
     try:
         lines = response_text.strip().split('\n')
         result_map = {}
-        
-        # Expected keys (lowercase for case-insensitive matching)
-        expected_keys = [
-            'grammar_fluency', 
-            'single_correct_key', 
-            'option_uniqueness', 
-            'answerable_from_source', 
-            'topic_relevant', 
-            'ethics_privacy_safe'
-        ]
-
         for line in lines:
-            line_lower = line.lower().strip()
-            if ":" in line_lower:
-                # Split only on the first colon
+            if ":" in line:
                 key, value = line.split(":", 1)
-                # Clean key: lowercase, replace underscores/spaces
                 clean_key = key.strip().lower().replace(' ', '_')
-                # Clean value: uppercase, strip whitespace
                 clean_value = value.strip().upper()
                 result_map[clean_key] = clean_value
 
-        # Check each expected key
         grammar_ok = result_map.get('grammar_fluency') == 'YES'
-        single_key_ok = result_map.get('single_correct_key') == 'YES'
-        uniqueness_ok = result_map.get('option_uniqueness') == 'YES'
         answerable_ok = result_map.get('answerable_from_source') == 'YES'
         ethics_ok = result_map.get('ethics_privacy_safe') == 'YES'
-        
-        # Topic relevance: YES or N/A are considered OK. Only explicit NO fails.
-        topic_verdict = result_map.get('topic_relevant')
-        topic_ok = topic_verdict != 'NO' # True if YES, N/A, or key missing
-        
-        # Log the parsed results for debugging
-        logger.debug(f"Parsed validation: Grammar={grammar_ok}, SingleKey={single_key_ok}, Unique={uniqueness_ok}, Answerable={answerable_ok}, Topic={topic_ok} (Verdict: {topic_verdict}), Ethics={ethics_ok}")
 
-        return grammar_ok, single_key_ok, uniqueness_ok, answerable_ok, topic_ok, ethics_ok
+        # Topic relevance: YES or N/A are OK; only an explicit NO fails.
+        topic_verdict = result_map.get('topic_relevant')
+        topic_ok = topic_verdict != 'NO'
+
+        logger.debug(f"Parsed validation: Grammar={grammar_ok}, Answerable={answerable_ok}, Topic={topic_ok} (Verdict: {topic_verdict}), Ethics={ethics_ok}")
+        return grammar_ok, answerable_ok, topic_ok, ethics_ok
 
     except Exception as e:
-        logger.warning(f"Could not parse new 6-line validation response: '{response_text}'. Error: {e}")
-        # Return default False values on parsing error
-        return False, False, False, False, False, False 
+        logger.warning(f"Could not parse 4-line validation response: '{response_text}'. Error: {e}")
+        return False, False, False, False
 
 def validate_qa_pairs(qa_pairs, llm_client, sample_rate=1.0, topic: str | None = None):
     """
@@ -432,16 +355,13 @@ def validate_qa_pairs(qa_pairs, llm_client, sample_rate=1.0, topic: str | None =
         structurally_rejected_count = 0
         for idx, pair in pairs_to_validate_map.items():
              question = pair.get("question")
-             options = pair.get("options")
-             correct_key = pair.get("correct_answer_key")
+             answer = pair.get("answer")
              is_structurally_valid = True
              rejection_reason = []
              if not question or not isinstance(question, str) or len(question) < MIN_QUESTION_LEN or len(question) > MAX_QUESTION_LEN:
                  is_structurally_valid = False; rejection_reason.append("Invalid/missing/length question")
-             if not options or not isinstance(options, dict) or len(options) < 2 or not all(isinstance(v, str) and v for v in options.values()):
-                 is_structurally_valid = False; rejection_reason.append("Invalid/missing/empty options")
-             if not correct_key or not isinstance(correct_key, str) or correct_key not in options:
-                 is_structurally_valid = False; rejection_reason.append(f"Invalid/missing correct_answer_key ('{correct_key}')")
+             if not answer or not isinstance(answer, str) or len(answer) < MIN_ANSWER_LEN:
+                 is_structurally_valid = False; rejection_reason.append("Invalid/missing/short answer")
              
              if is_structurally_valid:
                  structurally_valid_pairs.append(pair)
@@ -468,8 +388,7 @@ def validate_qa_pairs(qa_pairs, llm_client, sample_rate=1.0, topic: str | None =
         # First pass: Structural checks and submit valid ones to executor
         for idx, pair in pairs_to_validate_map.items():
             question = pair.get("question")
-            options = pair.get("options")
-            correct_key = pair.get("correct_answer_key")
+            answer = pair.get("answer")
             source_details = pair.get("source_details")
             
             is_structurally_valid = True
@@ -478,10 +397,8 @@ def validate_qa_pairs(qa_pairs, llm_client, sample_rate=1.0, topic: str | None =
             # Perform structural checks
             if not question or not isinstance(question, str) or len(question) < MIN_QUESTION_LEN or len(question) > MAX_QUESTION_LEN:
                 is_structurally_valid = False; structural_rejection_reason.append("Invalid/missing/length question")
-            if not options or not isinstance(options, dict) or len(options) < 2 or not all(isinstance(v, str) and v for v in options.values()):
-                is_structurally_valid = False; structural_rejection_reason.append("Invalid/missing/empty options")
-            if not correct_key or not isinstance(correct_key, str) or correct_key not in options:
-                is_structurally_valid = False; structural_rejection_reason.append(f"Invalid/missing correct_answer_key ('{correct_key}')")
+            if not answer or not isinstance(answer, str) or len(answer) < MIN_ANSWER_LEN:
+                is_structurally_valid = False; structural_rejection_reason.append("Invalid/missing/short answer")
             if not source_details: # Need source details for LLM check
                 is_structurally_valid = False; structural_rejection_reason.append("Missing source details for LLM validation")
 
@@ -491,7 +408,7 @@ def validate_qa_pairs(qa_pairs, llm_client, sample_rate=1.0, topic: str | None =
                 source_type = pair.get("source_type")
                 validation_human_prompt = _format_combined_validation_prompt(pair, source_type, source_details, topic=topic) 
                 validation_messages = [
-                    SystemMessage(content=SYSTEM_PROMPT_MCQ_VALIDATION),
+                    SystemMessage(content=SYSTEM_PROMPT_QA_VALIDATION),
                     HumanMessage(content=validation_human_prompt)
                 ]
                 future = executor.submit(safe_generate, llm_client, validation_messages, timeout_seconds=45)
@@ -499,7 +416,7 @@ def validate_qa_pairs(qa_pairs, llm_client, sample_rate=1.0, topic: str | None =
             else:
                 # Log rejection based on structural checks immediately
                 rejected_count += 1
-                logger.debug(f"Rejected pair #{idx} pre-LLM check: Reason(s): {'; '.join(structural_rejection_reason)}. Q: {str(question)[:50]}... Key: {correct_key}")
+                logger.debug(f"Rejected pair #{idx} pre-LLM check: Reason(s): {'; '.join(structural_rejection_reason)}. Q: {str(question)[:50]}...")
         
         logger.info(f"Submitted {pairs_submitted_to_llm} pairs (out of {num_to_validate} sampled) for LLM validation.")
 
@@ -515,12 +432,10 @@ def validate_qa_pairs(qa_pairs, llm_client, sample_rate=1.0, topic: str | None =
                 
                 if validation_response_text:
                     logger.debug(f"Raw validation response for pair #{original_idx}:\n---\n{validation_response_text}\n---")
-                    grammar_ok, single_key_ok, uniqueness_ok, answerable_ok, topic_ok, ethics_ok = parse_combined_validation_response(validation_response_text)
+                    grammar_ok, answerable_ok, topic_ok, ethics_ok = parse_combined_validation_response(validation_response_text)
                     
                     # Apply all checks from the parser
                     if not grammar_ok: is_valid = False; llm_rejection_reason.append("LLM grammar/clarity check failed")
-                    if not single_key_ok: is_valid = False; llm_rejection_reason.append("LLM single key check failed")
-                    if not uniqueness_ok: is_valid = False; llm_rejection_reason.append(f"LLM uniqueness check failed")
                     if not answerable_ok: is_valid = False; llm_rejection_reason.append(f"LLM answerability check failed")
                     if not topic_ok: is_valid = False; llm_rejection_reason.append(f"LLM topic relevance check failed (Topic: '{topic}')")
                     if not ethics_ok: is_valid = False; llm_rejection_reason.append(f"LLM ethics check failed")
@@ -539,7 +454,7 @@ def validate_qa_pairs(qa_pairs, llm_client, sample_rate=1.0, topic: str | None =
                 validated_pairs_map[original_idx] = pair # Store accepted pair by index
             else:
                 rejected_count += 1
-                logger.debug(f"Rejected pair #{original_idx} post-LLM check: Reason(s): {'; '.join(llm_rejection_reason)}. Q: {pair.get('question', '')[:50]}... Key: {pair.get('correct_answer_key')}")
+                logger.debug(f"Rejected pair #{original_idx} post-LLM check: Reason(s): {'; '.join(llm_rejection_reason)}. Q: {pair.get('question', '')[:50]}...")
 
             # Log progress
             if processed_count % progress_interval == 0 or processed_count == pairs_submitted_to_llm:
@@ -570,22 +485,6 @@ def validate_qa_pairs(qa_pairs, llm_client, sample_rate=1.0, topic: str | None =
     
     return final_validated_pairs
 
-def save_qa_pairs(qa_pairs, filepath="generated_qa_pairs.json"):
-    """
-    Saves the validated QA pairs to a JSON file.
-    """
-    logger.info(f"Attempting to save {len(qa_pairs)} QA pairs to {filepath}...")
-    try:
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(qa_pairs, f, ensure_ascii=False, indent=4)
-        logger.info(f"Successfully saved QA pairs to {filepath}")
-    except IOError as e:
-        logger.error(f"IOError saving QA pairs to {filepath}: {e}")
-    except TypeError as e:
-        logger.error(f"TypeError during JSON serialization: {e}. Check data types in qa_pairs.")
-    except Exception as e:
-        logger.error(f"An unexpected error occurred while saving QA pairs: {e}") 
-
 # --- NEW MULTI-HOP PROMPT FUNCTION ---
 def _format_multihop_qa_prompt(path_data, topic: str | None = None):
     """Formats the Human prompt for the LLM to generate multiple-choice QA pairs.
@@ -612,7 +511,7 @@ def _format_multihop_qa_prompt(path_data, topic: str | None = None):
     topic_instruction = f"IMPORTANT: The generated Question and Options MUST be relevant to the overall topic: '{topic}'." if topic else ""
 
     # Construct the Human Prompt content
-    human_prompt = f"""Follow the instructions in the system prompt to generate a multiple-choice question based on the provided path and node descriptions.
+    human_prompt = f"""Follow the instructions in the system prompt to generate an open-ended question and a concise free-form answer based on the provided path and node descriptions.
 
 Example 1:
 Path: (Paris)-[:CAPITAL_OF]->(France)-[:MEMBER_OF]->(European Union)
@@ -620,11 +519,7 @@ Start Node: Paris | Description: The capital city of France.
 End Node: European Union | Description: A political and economic union.
 
 Question: The country whose capital is Paris is a member of which union?
-A) NATO
-B) European Union
-C) United Nations
-D) African Union
-Correct Answer: B
+Answer: The European Union.
 
 Example 2:
 Path: (Hafiz)-[:EXPRESS_THEMES_OF]->(Love)-[:EXAMPLE_OF]->(Emotion)
@@ -632,11 +527,7 @@ Start Node: Hafiz | Description: A 14th-century Persian poet.
 End Node: Emotion | Description: A complex state of feeling.
 
 Question: What kind of concept is exemplified by a theme expressed in Hafiz's poetry?
-A) Historical Event
-B) Emotion
-C) Scientific Theory
-D) Geographical Location
-Correct Answer: B
+Answer: An emotion.
 
 {topic_instruction}
 
@@ -645,15 +536,11 @@ Path: {path_representation}
 Start Node: {start_node.get('name')} | Description: {start_desc}
 End Node: {end_node.get('name')} | Description: {end_desc}
 
-IMPORTANT: You MUST generate exactly four options (A, B, C, D) and indicate the single correct answer key. Adhere strictly to the output format below.
+IMPORTANT: Generate a single open-ended question and a concise free-form answer. Do NOT produce options or a correct-answer key. Adhere strictly to the output format below.
 
 Output:
 Question: [Your generated question reflecting the multi-step path]
-A) [Option A]
-B) [Option B]
-C) [Option C]
-D) [Option D]
-Correct Answer: [A, B, C, or D]
+Answer: [A concise free-form answer]
 """
     return human_prompt.strip()
 
@@ -729,7 +616,37 @@ Correct Answer: [Letter corresponding to the option containing the exact text '{
 """
     return human_prompt_reverse.strip()
 
-# --- NEW MCQ PARSER FUNCTION ---
+# --- OPEN-ENDED QA PARSER FUNCTION (forward path) ---
+def _parse_open_qa_output(text: str | None) -> dict | None:
+    """Parses LLM output for an open-ended Question and a free-form Answer.
+
+    Returns {"question", "answer"} or None. Each field is taken from its own line
+    (`Question:` / `Answer:`); a missing or empty field rejects the pair.
+    """
+    if not text:
+        return None
+
+    try:
+        question_match = re.search(r"Question:\s*(.*)", text, re.IGNORECASE)
+        answer_match = re.search(r"Answer:\s*(.*)", text, re.IGNORECASE)
+
+        if not question_match or not answer_match:
+            logger.warning(f"Could not parse Question/Answer from response: {text[:200]}...")
+            return None
+
+        question = question_match.group(1).strip()
+        answer = answer_match.group(1).strip()
+
+        if not question or not answer:
+            logger.warning(f"Parsed empty question or answer: Q={question!r}, A={answer!r}")
+            return None
+
+        return {"question": question, "answer": answer}
+    except Exception as e:
+        logger.error(f"Error parsing open QA response: {e}. Response: {text[:200]}...", exc_info=True)
+        return None
+
+# --- MCQ PARSER FUNCTION (kept only for the disabled reverse path) ---
 def _parse_mcq_output(text: str | None) -> dict | None:
     """Parses LLM output for Question, Options (A-D), and Correct Answer Key."""
     if not text:
@@ -808,22 +725,21 @@ def _process_single_path(path_data, llm_client, topic: str | None = None, genera
             # Call safe_generate with the list of messages and increased timeout
             generated_qa_output = safe_generate(llm_client, messages_forward, timeout_seconds=60)
             duration = time.time() - start_time
-            logger.debug(f"LLM call (Forward MCQ, complexity {complexity}) for path starting at '{start_node_name}' took {duration:.2f}s")
+            logger.debug(f"LLM call (Forward open QA, complexity {complexity}) for path starting at '{start_node_name}' took {duration:.2f}s")
 
-            parsed_mcq = _parse_mcq_output(generated_qa_output)
-            if parsed_mcq:
+            parsed_qa = _parse_open_qa_output(generated_qa_output)
+            if parsed_qa:
                 pair_id = str(uuid.uuid4())
                 generated_pairs.append({
                     "id": pair_id,
-                    "question": parsed_mcq["question"],
-                    "options": parsed_mcq["options"],
-                    "correct_answer_key": parsed_mcq["correct_answer_key"],
-                    "source_type": "multi_hop_path_mcq", # New source type
+                    "question": parsed_qa["question"],
+                    "answer": parsed_qa["answer"],
+                    "source_type": "multi_hop_path_open", # Open-ended source type
                     "complexity": complexity,
                     "source_details": source_details
                 })
             else:
-                logger.warning(f"Failed to parse forward MCQ output for path '{start_node_name}'.")
+                logger.warning(f"Failed to parse forward open QA output for path '{start_node_name}'.")
         # else: Do nothing if forward human prompt formatting failed
 
         # --- Generate Reverse MCQ Pair (Optional) ---
