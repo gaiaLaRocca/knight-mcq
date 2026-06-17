@@ -68,6 +68,36 @@ class WikipediaLookup:
             num_search_results=num_search_results,
         )
 
+    def lookup_chunks(
+        self,
+        term: str,
+        context_hint: str | None = None,
+        *,
+        llm: Any = None,
+        topic: str | None = None,
+        doc_content_chars_max: int = 1000,
+        num_search_results: int = 5,
+    ) -> tuple[list[str], bool]:
+        """Topic-aware variant of `lookup` returning the selected chunks separately.
+
+        Returns (list of up to two chunks, is_ambiguous) instead of a single joined
+        summary, so callers that store chunks individually (the Phase 1 KB recorder)
+        keep the topic chunk and the entity chunk as distinct list entries. When
+        `topic` is None this degrades to the single entity chunk.
+        """
+        if llm is None:
+            raise ValueError("WikipediaLookup requires an LLM instance for relevance checks.")
+        from app.core.utils.wikipedia_lookup import get_wikipedia_chunks
+
+        return get_wikipedia_chunks(
+            llm=llm,
+            term=term,
+            context_hint=context_hint,
+            topic=topic,
+            doc_content_chars_max=doc_content_chars_max,
+            num_search_results=num_search_results,
+        )
+
 
 class PDFLookup:
     """External knowledge implementation using PDF files (local path or URL)."""

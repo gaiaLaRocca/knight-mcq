@@ -31,6 +31,109 @@ text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=1000, chunk_overlap=100, length_function=len,
 )
 
+def get_wikipedia_chunks(llm: ChatOpenAI, term: str, context_hint: str | None = None, topic: str | None = None, doc_content_chars_max: int = 1000, num_search_results: int = 5) -> tuple[list[str], bool]:
+    """
+    Fetches up to two relevant text chunks using LLM for relevance check.
+    Checks the top `num_search_results` from wikipedia.search.
+    Pipeline for each result: LLM Relevance Check -> Validation -> Fetch -> Chunk -> Select Chunks.
+    Returns the topic chunk and the entity chunk of the first valid page (see `_select_chunks`).
+
+    Args:
+        llm: The ChatOpenAI instance to use for relevance checks.
+        term: The term to search for on Wikipedia.
+        context_hint: Optional context (e.g., parent term) for the LLM relevance check.
+        topic: Optional overall topic; when set, a chunk mentioning it is added so the
+            entity's link to the topic is retained (the two-chunk rule). When None, only
+            the entity chunk is returned (legacy single-chunk behaviour).
+        doc_content_chars_max: Max chars for each returned chunk.
+        num_search_results: How many top search results to check (default 5).
+
+    Returns:
+        A tuple: (list of up to two Wikipedia text chunks (possibly empty),
+        boolean indicating if ambiguity was detected).
+    """
+    logger.info(f"Performing Wikipedia lookup for term: '{term}'") # Log lookup attempt
+    page_title_guess = None
+    validated_title = None
+    is_ambiguous = False # Flag for ambiguity
+    try:
+        wikipedia.set_lang("en")
+        search_results = wikipedia.search(term, results=num_search_results)
+        if not search_results:
+            logger.warning(f"[wikipedia] search found no results for term: {term}")
+            return [], is_ambiguous
+
+        logger.debug(f"[wikipedia] search for '{term}' yielded {len(search_results)} candidates: {search_results}")
+
+        for i, page_title_guess in enumerate(search_results):
+            logger.debug(f"Attempting candidate {i+1}/{len(search_results)}: '{page_title_guess}'")
+            validated_title = None # Reset for each candidate
+
+            # 2. LLM Relevance Check for this candidate
+            if not _is_title_relevant_llm(llm, term, page_title_guess, context_hint):
+                logger.debug(f"LLM relevance check failed for candidate '{page_title_guess}'. Skipping.")
+                continue # Try next candidate
+            logger.debug(f"LLM relevance check passed for candidate '{page_title_guess}'")
+
+            # 3. Validate Title for this relevant candidate
+            try:
+                validated_page = wikipedia.page(page_title_guess, auto_suggest=False)
+                validated_title = validated_page.title
+                logger.debug(f"[wikipedia] validation successful. Canonical title: '{validated_title}'")
+            except wikipedia.exceptions.DisambiguationError as e:
+                if i == 0:
+                    logger.warning(f"[wikipedia] validation failed: Top search result '{page_title_guess}' for term '{term}' is ambiguous. Stopping lookup. Options: {e.options[:5]}...")
+                    is_ambiguous = True # Set flag
+                    return [], is_ambiguous # Return [], True
+                else:
+                    logger.debug(f"[wikipedia] validation failed: Candidate '{page_title_guess}' is ambiguous. Skipping candidate.")
+                    continue # Try next candidate
+            except wikipedia.exceptions.PageError as e:
+                logger.debug(f"[wikipedia] validation failed: Page '{page_title_guess}' does not exist. Skipping candidate.")
+                continue # Try next candidate
+            except Exception as e_val:
+                 logger.warning(f"Unexpected error during wikipedia.page validation for '{page_title_guess}': {e_val}. Skipping candidate.")
+                 continue # Try next candidate
+
+            # If validation succeeded, proceed to fetch and chunk
+            # 4. Fetch Full Text via wikipedia-api
+            api_page = wiki_api.page(validated_title)
+            if not api_page.exists():
+                logger.warning(f"[wikipedia-api] page '{validated_title}' exists according to wikipedia.page but not wikipedia-api. Skipping candidate.")
+                continue # Try next candidate
+            content = api_page.text
+            if not content or not content.strip():
+                 logger.warning(f"Wikipedia text was empty for '{validated_title}'. Skipping candidate.")
+                 continue # Try next candidate
+            logger.debug(f"Fetched full text ({len(content)} chars) for '{validated_title}'")
+
+            # 5. Chunk the Text
+            chunks = text_splitter.split_text(content)
+            if not chunks:
+                 logger.warning(f"Text splitting yielded no chunks for '{validated_title}'. Skipping candidate.")
+                 continue # Try next candidate
+            logger.debug(f"Split text into {len(chunks)} chunks.")
+
+            # 6. Select up to two chunks: the topic chunk and the entity chunk.
+            selected = _select_chunks(chunks, term=term, topic=topic, max_chars=doc_content_chars_max)
+            if selected:
+                logger.info(f"Success! Selected {len(selected)} chunk(s) for term '{term}' in page '{validated_title}' (from candidate '{page_title_guess}')")
+                logger.debug(f"First selected chunk snippet: \"{selected[0][:200]}...\"")
+                return selected, is_ambiguous
+
+            # If we reach here for a candidate, it means chunking likely failed or produced empty chunks somehow
+            logger.debug(f"No suitable chunk found for page '{validated_title}'. Trying next candidate.")
+
+        logger.warning(f"Checked {len(search_results)} candidates for term '{term}', but found no relevant, valid page with usable chunks.")
+        return [], is_ambiguous # Return [], False (or True if ambiguity stopped earlier)
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Network/SSL error during Wikipedia lookup for '{term}': {e}")
+        return [], False # Return [], False on network error
+    except Exception as e:
+        logger.error(f"Unexpected error during Wikipedia lookup for '{term}' (last guess: {page_title_guess}, last validated: {validated_title}): {e}", exc_info=True)
+        return [], False # Return [], False on other errors
+
 def _is_title_relevant_llm(llm: ChatOpenAI, term: str, title_guess: str, context_hint: str | None) -> bool:
     """Uses LLM to check if a Wikipedia title is relevant for defining a term in context.
     Now uses System + Human prompts.
@@ -74,116 +177,60 @@ Respond with only one word: "Yes" or "No".
         logger.error(f"Error during LLM relevance check for '{term}' -> '{title_guess}': {e}", exc_info=True)
         return False # Assume not relevant on error
 
-def get_wikipedia_summary(llm: ChatOpenAI, term: str, context_hint: str | None = None, doc_content_chars_max: int = 1000, num_search_results: int = 5) -> tuple[str | None, bool]:
+def _select_chunks(chunks: list[str], term: str, topic: str | None, max_chars: int) -> list[str]:
+    """Pick up to two de-duplicated chunks from one validated page, topic chunk first.
+
+    Implements the two-chunk rule of docs/phase1_kb_quality_plan.md (step 3,
+    "Chunk selection within a kept page"):
+
+      1. topic chunk  -- the first chunk mentioning the topic (e.g. "golden gate
+         bridge"): WHY the entity matters to the topic. Skipped when no topic is
+         given or no chunk mentions it (e.g. an off-topic page like `fog`).
+      2. entity chunk -- the first chunk mentioning the term, else the first chunk:
+         the entity's own intro / definition.
+
+    Multi-hop graph-path questions need both halves (e.g. "where was the designer of
+    the Golden Gate Bridge born?": the topic link is in the topic chunk, the
+    birthplace in the biographical intro chunk). Each chunk is stripped and truncated
+    to `max_chars`; if the topic chunk and the entity chunk are the same chunk it is
+    returned once. Returns [] only when `chunks` is empty.
     """
-    Fetches the most relevant text chunk using LLM for relevance check.
-    Checks the top `num_search_results` from wikipedia.search.
-    Pipeline for each result: LLM Relevance Check -> Validation -> Fetch -> Chunk -> Select Chunk.
-    Returns the first chunk containing the term, or the very first chunk as a fallback.
+    if not chunks:
+        return []
+    selected: list[str] = []
 
-    Args:
-        llm: The ChatOpenAI instance to use for relevance checks.
-        term: The term to search for on Wikipedia.
-        context_hint: Optional context (e.g., parent term) for the LLM relevance check.
-        doc_content_chars_max: Max chars for the returned chunk.
-        num_search_results: How many top search results to check (default 5).
+    if topic:
+        topic_lower = topic.lower()
+        topic_chunk = next((c for c in chunks if topic_lower in c.lower()), None)
+        if topic_chunk is not None:
+            selected.append(topic_chunk.strip()[:max_chars])
 
-    Returns:
-        A tuple: (Relevant Wikipedia text chunk or None, boolean indicating if ambiguity was detected).
+    term_lower = term.lower()
+    entity_chunk = next((c for c in chunks if term_lower in c.lower()), chunks[0])
+    entity_chunk = entity_chunk.strip()[:max_chars]
+    if entity_chunk not in selected:
+        selected.append(entity_chunk)
+
+    return selected
+
+def get_wikipedia_summary(llm: ChatOpenAI, term: str, context_hint: str | None = None, topic: str | None = None, doc_content_chars_max: int = 1000, num_search_results: int = 5) -> tuple[str | None, bool]:
+    """Backward-compatible single-string view over `get_wikipedia_chunks`.
+
+    Joins the selected chunks into one summary block (None if none were found), so
+    existing callers that expect a single text context (term-description generation)
+    are unchanged. Pass `topic` to also get the topic chunk; omit it for the legacy
+    entity-only chunk.
     """
-    logger.info(f"Performing Wikipedia lookup for term: '{term}'") # Log lookup attempt
-    page_title_guess = None
-    validated_title = None
-    is_ambiguous = False # Flag for ambiguity
-    try:
-        wikipedia.set_lang("en")
-        search_results = wikipedia.search(term, results=num_search_results)
-        if not search_results:
-            logger.warning(f"[wikipedia] search found no results for term: {term}")
-            return None, is_ambiguous
-        
-        logger.debug(f"[wikipedia] search for '{term}' yielded {len(search_results)} candidates: {search_results}")
-
-        for i, page_title_guess in enumerate(search_results):
-            logger.debug(f"Attempting candidate {i+1}/{len(search_results)}: '{page_title_guess}'")
-            validated_title = None # Reset for each candidate
-            
-            # 2. LLM Relevance Check for this candidate
-            if not _is_title_relevant_llm(llm, term, page_title_guess, context_hint):
-                logger.debug(f"LLM relevance check failed for candidate '{page_title_guess}'. Skipping.")
-                continue # Try next candidate
-            logger.debug(f"LLM relevance check passed for candidate '{page_title_guess}'")
-
-            # 3. Validate Title for this relevant candidate
-            try:
-                validated_page = wikipedia.page(page_title_guess, auto_suggest=False)
-                validated_title = validated_page.title
-                logger.debug(f"[wikipedia] validation successful. Canonical title: '{validated_title}'")
-            except wikipedia.exceptions.DisambiguationError as e:
-                if i == 0:
-                    logger.warning(f"[wikipedia] validation failed: Top search result '{page_title_guess}' for term '{term}' is ambiguous. Stopping lookup. Options: {e.options[:5]}...")
-                    is_ambiguous = True # Set flag
-                    return None, is_ambiguous # Return None, True
-                else:
-                    logger.debug(f"[wikipedia] validation failed: Candidate '{page_title_guess}' is ambiguous. Skipping candidate.")
-                    continue # Try next candidate
-            except wikipedia.exceptions.PageError as e:
-                logger.debug(f"[wikipedia] validation failed: Page '{page_title_guess}' does not exist. Skipping candidate.")
-                continue # Try next candidate
-            except Exception as e_val:
-                 logger.warning(f"Unexpected error during wikipedia.page validation for '{page_title_guess}': {e_val}. Skipping candidate.")
-                 continue # Try next candidate
-
-            # If validation succeeded, proceed to fetch and chunk
-            # 4. Fetch Full Text via wikipedia-api
-            api_page = wiki_api.page(validated_title)
-            if not api_page.exists():
-                logger.warning(f"[wikipedia-api] page '{validated_title}' exists according to wikipedia.page but not wikipedia-api. Skipping candidate.")
-                continue # Try next candidate
-            content = api_page.text
-            if not content or not content.strip():
-                 logger.warning(f"Wikipedia text was empty for '{validated_title}'. Skipping candidate.")
-                 continue # Try next candidate
-            logger.debug(f"Fetched full text ({len(content)} chars) for '{validated_title}'")
-
-            # 5. Chunk the Text
-            chunks = text_splitter.split_text(content)
-            if not chunks:
-                 logger.warning(f"Text splitting yielded no chunks for '{validated_title}'. Skipping candidate.")
-                 continue # Try next candidate
-            logger.debug(f"Split text into {len(chunks)} chunks.")
-
-            # 6. Select First Relevant Chunk (or fallback to first chunk)
-            relevant_chunk = None
-            found_exact_match = False
-            search_term_lower = term.lower()
-            for i_chunk, chunk in enumerate(chunks):
-                if search_term_lower in chunk.lower():
-                    relevant_chunk = chunk.strip()
-                    found_exact_match = True
-                    logger.info(f"Success! Found chunk #{i_chunk+1} containing term '{term}' in page '{validated_title}' (from candidate '{page_title_guess}')")
-                    logger.debug(f"Relevant chunk snippet ({len(relevant_chunk)} chars): \"{relevant_chunk[:200]}...\"")
-                    return relevant_chunk[:doc_content_chars_max], is_ambiguous # Return chunk, False
-            
-            # Fallback: If no chunk contained the exact term, return the first chunk
-            if not found_exact_match and chunks:
-                relevant_chunk = chunks[0].strip()
-                logger.info(f"Term '{term}' not found in any chunk of '{validated_title}'. Falling back to first chunk.")
-                logger.debug(f"Fallback chunk snippet ({len(relevant_chunk)} chars): \"{relevant_chunk[:200]}...\"")
-                return relevant_chunk[:doc_content_chars_max], is_ambiguous # Return chunk, False
-
-            # If we reach here for a candidate, it means chunking likely failed or produced empty chunks somehow
-            logger.debug(f"No suitable chunk found for page '{validated_title}'. Trying next candidate.")
-
-        logger.warning(f"Checked {len(search_results)} candidates for term '{term}', but found no relevant, valid page with usable chunks.")
-        return None, is_ambiguous # Return None, False (or True if ambiguity stopped earlier)
-
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Network/SSL error during Wikipedia lookup for '{term}': {e}")
-        return None, False # Return None, False on network error
-    except Exception as e:
-        logger.error(f"Unexpected error during Wikipedia lookup for '{term}' (last guess: {page_title_guess}, last validated: {validated_title}): {e}", exc_info=True)
-        return None, False # Return None, False on other errors
+    chunks, is_ambiguous = get_wikipedia_chunks(
+        llm=llm,
+        term=term,
+        context_hint=context_hint,
+        topic=topic,
+        doc_content_chars_max=doc_content_chars_max,
+        num_search_results=num_search_results,
+    )
+    summary = "\n\n".join(chunks) if chunks else None
+    return summary, is_ambiguous
 
 # Update example usage expectations
 if __name__ == '__main__':
