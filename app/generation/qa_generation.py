@@ -529,6 +529,29 @@ End Node: Emotion | Description: A complex state of feeling.
 Question: What kind of concept is exemplified by a theme expressed in Hafiz's poetry?
 Answer: An emotion.
 
+PHRASING RULES (read carefully):
+- Refer to entities by their real-world identity in fluent, natural prose. Do NOT copy or
+  quote raw node labels from the Path verbatim into the Question — especially do NOT put
+  path labels inside quotation marks.
+- Do NOT name intermediate or sibling nodes that are not needed to phrase the question.
+- The Question must be specifically about the subject of the Path, not a generic question
+  that could apply to any bridge, city, or object. The answer must require the specific
+  entities on this Path.
+
+Example 3 (shows the mistakes to AVOID and how to fix them):
+Path: (depth of bay and strong currents)-[:INFLUENCED_OPERATION]->(Golden Gate Bridge)-[:LOCATED_AT]->(San Francisco Bay)
+BAD Question: Considering the influence of "depth of bay and strong currents", what engineering challenges were addressed during the construction of the Golden Gate Bridge?
+  -> BAD because it copies the raw node label "depth of bay and strong currents" verbatim, in quotes.
+GOOD Question: What did the deep water and powerful currents of San Francisco Bay force engineers to do when founding the Golden Gate Bridge?
+GOOD Answer: Sink massive caissons to the bay floor for stable foundations.
+
+Example 4 (shows a too-generic question to AVOID):
+Path: (depth of bay)-[:SHAPED_DESIGN]->(Golden Gate Bridge)-[:PROVIDED_FOUNDATION]->(bridge)
+BAD Question: How might understanding the bathymetry of a bay influence the design and construction of a bridge crossing it?
+  -> BAD because it is generic: it never mentions the Golden Gate Bridge and could apply to any bridge over any bay.
+GOOD Question: How did the depth of San Francisco Bay shape the foundation design of the Golden Gate Bridge?
+GOOD Answer: Its depth dictated where and how the bridge's supporting piers could be founded.
+
 {topic_instruction}
 
 Now, generate for the following:
