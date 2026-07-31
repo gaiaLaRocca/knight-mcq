@@ -31,6 +31,14 @@ text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=1000, chunk_overlap=100, length_function=len,
 )
 
+# Optional topic-relevance scorer for candidate-page disambiguation, injected by the
+# thesis runner (kept out of the fork so it stays pinnable). A callable str -> float
+# returning cosine(embed(text), embed(topic_anchor)). When set, get_wikipedia_chunks
+# ranks the validated candidate pages by this score and keeps the best, instead of
+# taking the first page that passes the self-judging LLM title check (see
+# docs/phase1_kb_quality_plan.md step 5b.3). When None, the legacy behaviour holds.
+topic_relevance_scorer = None
+
 def get_wikipedia_chunks(llm: ChatOpenAI, term: str, context_hint: str | None = None, topic: str | None = None, doc_content_chars_max: int = 1000, num_search_results: int = 5) -> tuple[list[str], bool]:
     """
     Fetches up to two relevant text chunks using LLM for relevance check.
@@ -65,17 +73,22 @@ def get_wikipedia_chunks(llm: ChatOpenAI, term: str, context_hint: str | None = 
 
         logger.debug(f"[wikipedia] search for '{term}' yielded {len(search_results)} candidates: {search_results}")
 
+        scorer = topic_relevance_scorer  # thesis-injected; None => legacy LLM-check path
+        ranked = []  # (score, selected, validated_title), collected when scorer is set
+
         for i, page_title_guess in enumerate(search_results):
             logger.debug(f"Attempting candidate {i+1}/{len(search_results)}: '{page_title_guess}'")
             validated_title = None # Reset for each candidate
 
-            # 2. LLM Relevance Check for this candidate
-            if not _is_title_relevant_llm(llm, term, page_title_guess, context_hint):
+            # Legacy path uses the self-judging LLM title check as the filter. The ranked
+            # path (scorer set) skips it and instead ranks the validated pages by topic
+            # cosine below (step 5b.3), removing that circularity and the per-candidate
+            # LLM call.
+            if scorer is None and not _is_title_relevant_llm(llm, term, page_title_guess, context_hint):
                 logger.debug(f"LLM relevance check failed for candidate '{page_title_guess}'. Skipping.")
                 continue # Try next candidate
-            logger.debug(f"LLM relevance check passed for candidate '{page_title_guess}'")
 
-            # 3. Validate Title for this relevant candidate
+            # Validate Title for this candidate
             try:
                 validated_page = wikipedia.page(page_title_guess, auto_suggest=False)
                 validated_title = validated_page.title
@@ -96,7 +109,7 @@ def get_wikipedia_chunks(llm: ChatOpenAI, term: str, context_hint: str | None = 
                  continue # Try next candidate
 
             # If validation succeeded, proceed to fetch and chunk
-            # 4. Fetch Full Text via wikipedia-api
+            # Fetch Full Text via wikipedia-api
             api_page = wiki_api.page(validated_title)
             if not api_page.exists():
                 logger.warning(f"[wikipedia-api] page '{validated_title}' exists according to wikipedia.page but not wikipedia-api. Skipping candidate.")
@@ -107,22 +120,39 @@ def get_wikipedia_chunks(llm: ChatOpenAI, term: str, context_hint: str | None = 
                  continue # Try next candidate
             logger.debug(f"Fetched full text ({len(content)} chars) for '{validated_title}'")
 
-            # 5. Chunk the Text
+            # Chunk the Text
             chunks = text_splitter.split_text(content)
             if not chunks:
                  logger.warning(f"Text splitting yielded no chunks for '{validated_title}'. Skipping candidate.")
                  continue # Try next candidate
             logger.debug(f"Split text into {len(chunks)} chunks.")
 
-            # 6. Select up to two chunks: the topic chunk and the entity chunk.
+            # Select up to two chunks: the topic chunk and the entity chunk.
             selected = _select_chunks(chunks, term=term, topic=topic, max_chars=doc_content_chars_max)
-            if selected:
+            if not selected:
+                logger.debug(f"No suitable chunk found for page '{validated_title}'. Trying next candidate.")
+                continue # Try next candidate
+
+            if scorer is None:
+                # Legacy: the first valid, LLM-approved candidate wins.
                 logger.info(f"Success! Selected {len(selected)} chunk(s) for term '{term}' in page '{validated_title}' (from candidate '{page_title_guess}')")
                 logger.debug(f"First selected chunk snippet: \"{selected[0][:200]}...\"")
                 return selected, is_ambiguous
 
-            # If we reach here for a candidate, it means chunking likely failed or produced empty chunks somehow
-            logger.debug(f"No suitable chunk found for page '{validated_title}'. Trying next candidate.")
+            # Ranked path: score the page's own intro (chunks[0]) against the topic anchor
+            # and keep the candidate for the argmax below.
+            try:
+                score = scorer(chunks[0])
+            except Exception as e_score:
+                logger.warning(f"[wikipedia] topic-relevance scorer failed for '{validated_title}': {e_score}. Scoring -inf.")
+                score = float("-inf")
+            logger.debug(f"[wikipedia] candidate '{validated_title}' topic-relevance score={score:.4f}")
+            ranked.append((score, selected, validated_title))
+
+        if scorer is not None and ranked:
+            best_score, best_selected, best_title = max(ranked, key=lambda c: c[0])
+            logger.info(f"Selected page '{best_title}' for term '{term}' by topic-relevance (score={best_score:.4f}) among {len(ranked)} candidate(s).")
+            return best_selected, is_ambiguous
 
         logger.warning(f"Checked {len(search_results)} candidates for term '{term}', but found no relevant, valid page with usable chunks.")
         return [], is_ambiguous # Return [], False (or True if ambiguity stopped earlier)
