@@ -205,6 +205,24 @@ def create_relationship(conn, parent_term, child_term, relation="HAS_TERM"):
     except Exception as e:
         logger.error(f"Failed to create relationship '{relation_clean}' from '{parent_clean}' to '{child_clean}': {e}")
 
+
+def _is_wiki_fact_checked(conn, term) -> bool:
+    """True iff the term's node is Wikipedia-grounded (wiki_fact_checked == 'Yes').
+
+    Recursion-gate helper (docs/phase1_kb_quality_plan.md step 5b.2): tails that are
+    only LLM-described (no Wikipedia page) are ungrounded noise the downstream relevance
+    gate prunes anyway, so their invented descriptions must not be mined for sub-triplets.
+    On any query error, return False (conservative: do not recurse).
+    """
+    query = "MATCH (t:Term {name: $term}) RETURN t.wiki_fact_checked AS fact_checked"
+    try:
+        results = conn.query(query, parameters={"term": term})
+        return bool(results) and results[0]["fact_checked"] == "Yes"
+    except Exception as e:
+        logger.error(f"Error querying wiki_fact_checked for '{term}': {e}")
+        return False
+
+
 @retry(stop=stop_after_attempt(3),
        wait=wait_exponential(multiplier=1, min=2, max=10),
        retry=retry_if_exception_type(Exception), reraise=True)
@@ -286,7 +304,16 @@ def process_triplet(conn, llm: ChatOpenAI, triplet, parent_term, depth, max_dept
         else:
             # Check if the tail term (which was processed above) is suitable for further exploration
             if tail in current_query_processed_terms: # Check if it was processed (it should have been)
-                tail_description = query_term_description(conn, tail)
+                # Recursion gate (docs/phase1_kb_quality_plan.md step 5b.2): only expand
+                # Wikipedia-grounded tails. A non-fact-checked (LLM-only) tail is ungrounded
+                # noise the downstream relevance gate prunes anyway; mining sub-triplets from
+                # its invented description only multiplies that noise and the depth-2 cost.
+                # Grounded, on-topic tails still expand, so multi-hop branches survive.
+                if not _is_wiki_fact_checked(conn, tail):
+                    logger.info(f"Recursion gate: '{tail}' is not Wikipedia-fact-checked; skipping sub-triplet extraction.")
+                    tail_description = None
+                else:
+                    tail_description = query_term_description(conn, tail)
                 if tail_description and tail_description not in [DEFAULT_NO_DESCRIPTION, DEFAULT_ERROR_DESCRIPTION]:
                     sub_triplets = extract_clean_special_terms(tail_description) # Assuming this function extracts triplets correctly
                     logger.debug(f"Extracted {len(sub_triplets)} sub-triplets from description of '{tail}'")
