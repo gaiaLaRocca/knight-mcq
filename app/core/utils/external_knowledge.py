@@ -77,13 +77,16 @@ class WikipediaLookup:
         topic: str | None = None,
         doc_content_chars_max: int = 1000,
         num_search_results: int = 5,
-    ) -> tuple[list[str], bool]:
+        per_section: bool = False,
+    ) -> tuple[list[str], bool, str | None]:
         """Topic-aware variant of `lookup` returning the selected chunks separately.
 
-        Returns (list of up to two chunks, is_ambiguous) instead of a single joined
+        Returns (chunks, is_ambiguous, validated_title) instead of a single joined
         summary, so callers that store chunks individually (the Phase 1 KB recorder)
-        keep the topic chunk and the entity chunk as distinct list entries. When
-        `topic` is None this degrades to the single entity chunk.
+        keep the topic chunk and the entity chunk as distinct list entries, and can
+        record which Wikipedia page the text actually came from. When `topic` is None
+        this degrades to the single entity chunk; `per_section` returns the page's lead
+        plus one chunk per body section instead (for the topic entity).
         """
         if llm is None:
             raise ValueError("WikipediaLookup requires an LLM instance for relevance checks.")
@@ -96,6 +99,7 @@ class WikipediaLookup:
             topic=topic,
             doc_content_chars_max=doc_content_chars_max,
             num_search_results=num_search_results,
+            per_section=per_section,
         )
 
 
