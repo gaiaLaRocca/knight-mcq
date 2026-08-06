@@ -176,7 +176,11 @@ def get_wikipedia_chunks(llm: ChatOpenAI, term: str, context_hint: str | None = 
                 except Exception as e_score:
                     logger.warning(f"[wikipedia] topic-relevance scorer failed for '{validated_title}': {e_score}. Scoring -inf.")
                     score = float("-inf")
-                logger.debug(f"[wikipedia] in-band candidate '{validated_title}' topic-relevance score={score:.4f}")
+                # INFO, not DEBUG: with the band above, these scores *are* the page
+                # choice. Reading them per candidate is what shows a wrong winner as a
+                # ranking problem rather than a mystery (test_6: the topic's own page
+                # scoring ~1.0 for every term its lead names).
+                logger.info(f"[wikipedia] in-band candidate '{validated_title}' topic-relevance score={score:.4f}")
                 ranked.append((score, selected, validated_title))
 
             if ranked:
@@ -337,7 +341,10 @@ def _entity_relevance_band(term: str, titles: list[str]) -> list[str]:
         return titles
     best = max(s for _, s in scores)
     band = [t for t, s in scores if s >= best - PAGE_RANK_DELTA]
-    logger.debug(
+    # INFO: every candidate's title score plus the surviving band is the record of stage 1,
+    # and PAGE_RANK_DELTA is a calibrated constant — seeing the scores it admits and cuts
+    # on a real run is how it stays calibrated as topics change.
+    logger.info(
         "[wikipedia] entity relevance for '%s': %s -> band %s",
         term, [f"{t}={s:.3f}" for t, s in scores], band,
     )
