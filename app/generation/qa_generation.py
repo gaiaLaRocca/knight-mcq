@@ -487,7 +487,7 @@ def validate_qa_pairs(qa_pairs, llm_client, sample_rate=1.0, topic: str | None =
 
 # --- NEW MULTI-HOP PROMPT FUNCTION ---
 def _format_multihop_qa_prompt(path_data, topic: str | None = None):
-    """Formats the Human prompt for the LLM to generate multiple-choice QA pairs.
+    """Formats the Human prompt for the LLM to generate an open-ended QA pair.
     Args:
         path_data (dict): A dictionary representing the path...
         topic (str | None): The session topic, if any.
@@ -508,17 +508,40 @@ def _format_multihop_qa_prompt(path_data, topic: str | None = None):
     path_representation = "".join(path_str_parts)
     start_desc = start_node.get('description') or "No description available."
     end_desc = end_node.get('description') or "No description available."
-    topic_instruction = f"IMPORTANT: The generated Question and Options MUST be relevant to the overall topic: '{topic}'." if topic else ""
+    topic_instruction = f"IMPORTANT: The generated Question and Answer MUST be relevant to the overall topic: '{topic}'." if topic else ""
 
-    # Construct the Human Prompt content
+    # Construct the Human Prompt content.
+    #
+    # Every line after a `Question:` label in this prompt is a question worth imitating.
+    # The rules come first and the mistakes are described, never exhibited: a 4B model does
+    # not read a labelled counter-example as negative, it copies the best-formed sentence
+    # it can see. The earlier version showed a `BAD Question: Considering ...` and got back
+    # 25 questions out of 25 opening with "Considering" — each one spending its opening
+    # clause restating the path's first hop, which is the hop the question exists to make
+    # the reader traverse.
     human_prompt = f"""Follow the instructions in the system prompt to generate an open-ended question and a concise free-form answer based on the provided path and node descriptions.
+
+PHRASING RULES (read carefully):
+- Begin the Question with an interrogative word: What, Which, Who, When, Where, How or Why.
+  Never open with a scene-setting clause such as "Considering ...", "Given ...", "In light
+  of ...", "Regarding ...". Such a clause states a step of the Path, and the reader must
+  have to follow the Path to answer, not read it in the Question.
+- The Question states no fact from the Path. It names the entity to start from; every
+  relationship along the Path is what it asks about, never what it asserts.
+- Refer to entities by their real-world identity in fluent, natural prose. Do NOT copy or
+  quote raw node labels from the Path verbatim into the Question — especially do NOT put
+  path labels inside quotation marks.
+- Do NOT name intermediate or sibling nodes that are not needed to phrase the question.
+- The Question must be specifically about the subject of the Path, not a generic question
+  that could apply to any bridge, city, or object. The answer must require the specific
+  entities on this Path.
 
 Example 1:
 Path: (Paris)-[:CAPITAL_OF]->(France)-[:MEMBER_OF]->(European Union)
 Start Node: Paris | Description: The capital city of France.
 End Node: European Union | Description: A political and economic union.
 
-Question: The country whose capital is Paris is a member of which union?
+Question: Which union does the country whose capital is Paris belong to?
 Answer: The European Union.
 
 Example 2:
@@ -529,28 +552,21 @@ End Node: Emotion | Description: A complex state of feeling.
 Question: What kind of concept is exemplified by a theme expressed in Hafiz's poetry?
 Answer: An emotion.
 
-PHRASING RULES (read carefully):
-- Refer to entities by their real-world identity in fluent, natural prose. Do NOT copy or
-  quote raw node labels from the Path verbatim into the Question — especially do NOT put
-  path labels inside quotation marks.
-- Do NOT name intermediate or sibling nodes that are not needed to phrase the question.
-- The Question must be specifically about the subject of the Path, not a generic question
-  that could apply to any bridge, city, or object. The answer must require the specific
-  entities on this Path.
-
-Example 3 (shows the mistakes to AVOID and how to fix them):
+Example 3:
 Path: (depth of bay and strong currents)-[:INFLUENCED_OPERATION]->(Golden Gate Bridge)-[:LOCATED_AT]->(San Francisco Bay)
-BAD Question: Considering the influence of "depth of bay and strong currents", what engineering challenges were addressed during the construction of the Golden Gate Bridge?
-  -> BAD because it copies the raw node label "depth of bay and strong currents" verbatim, in quotes.
-GOOD Question: What did the deep water and powerful currents of San Francisco Bay force engineers to do when founding the Golden Gate Bridge?
-GOOD Answer: Sink massive caissons to the bay floor for stable foundations.
+Start Node: depth of bay and strong currents | Description: The bay is deep and its tidal currents are powerful.
+End Node: San Francisco Bay | Description: A large estuary on the coast of northern California.
 
-Example 4 (shows a too-generic question to AVOID):
-Path: (depth of bay)-[:SHAPED_DESIGN]->(Golden Gate Bridge)-[:PROVIDED_FOUNDATION]->(bridge)
-BAD Question: How might understanding the bathymetry of a bay influence the design and construction of a bridge crossing it?
-  -> BAD because it is generic: it never mentions the Golden Gate Bridge and could apply to any bridge over any bay.
-GOOD Question: How did the depth of San Francisco Bay shape the foundation design of the Golden Gate Bridge?
-GOOD Answer: Its depth dictated where and how the bridge's supporting piers could be founded.
+Question: What did the deep water and powerful currents of San Francisco Bay force engineers to do when founding the Golden Gate Bridge?
+Answer: Sink massive caissons to the bay floor for stable foundations.
+
+Example 4:
+Path: (Joseph Strauss)-[:CHIEF_ENGINEER_OF]->(Golden Gate Bridge)-[:OPENED_ON]->(May 27, 1937)
+Start Node: Joseph Strauss | Description: An engineer, born in Cincinnati, Ohio.
+End Node: May 27, 1937 | Description: The date the Golden Gate Bridge opened to the public.
+
+Question: When did the bridge built under Joseph Strauss as chief engineer open to the public?
+Answer: 27 May 1937.
 
 {topic_instruction}
 
@@ -559,7 +575,7 @@ Path: {path_representation}
 Start Node: {start_node.get('name')} | Description: {start_desc}
 End Node: {end_node.get('name')} | Description: {end_desc}
 
-IMPORTANT: Generate a single open-ended question and a concise free-form answer. Do NOT produce options or a correct-answer key. Adhere strictly to the output format below.
+IMPORTANT: Generate a single open-ended question and a concise free-form answer. Do NOT produce options or a correct-answer key. The Question must start with an interrogative word and must not open with a "Considering ..." or "Given ..." clause. Adhere strictly to the output format below.
 
 Output:
 Question: [Your generated question reflecting the multi-step path]
