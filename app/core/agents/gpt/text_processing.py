@@ -95,14 +95,16 @@ AVOID (BAD)
             try:
                 data = json.loads(json_str)
                 triplets = data.get("triplets", [])
-                # Basic validation: Check if it's a list and items are dicts with expected keys
-                if isinstance(triplets, list) and all(isinstance(t, dict) and all(k in t for k in ['head', 'relation', 'tail']) for t in triplets):
-                    logger.info(f"Successfully extracted {len(triplets)} triplets via JSON parsing.")
-                    return triplets
-                else:
-                    logger.warning("Parsed JSON structure is invalid. Falling back to regex.")
-                    # Fallback to regex on the original response might be better than regex on bad JSON
-                    return extract_triplets_from_text(response) 
+                if isinstance(triplets, list):
+                    well_formed, malformed = _partition_well_formed(triplets)
+                    if malformed:
+                        logger.warning(f"Dropped {len(malformed)} malformed triplet(s) of {len(triplets)}: {malformed}")
+                    if well_formed:
+                        logger.info(f"Successfully extracted {len(well_formed)} triplets via JSON parsing.")
+                        return well_formed
+                logger.warning("Parsed JSON structure is invalid. Falling back to regex.")
+                # Fallback to regex on the original response might be better than regex on bad JSON
+                return extract_triplets_from_text(response)
             except json.JSONDecodeError as json_err:
                 logger.warning(f"Failed to parse extracted JSON: {json_err}. Falling back to regex.")
                 return extract_triplets_from_text(response)
@@ -113,6 +115,33 @@ AVOID (BAD)
     except Exception as e:
         logger.error(f"Error during GPT triplet extraction process: {e}")
         return [] # Return empty list on major failure
+
+_TRIPLET_KEYS = ("head", "relation", "tail")
+
+def _partition_well_formed(triplets):
+    """Split parsed triplets into (usable, malformed) — see `_is_well_formed`."""
+    well_formed, malformed = [], []
+    for triplet in triplets:
+        (well_formed if _is_well_formed(triplet) else malformed).append(triplet)
+    return well_formed, malformed
+
+def _is_well_formed(triplet):
+    """True if head, relation and tail are all present AND non-empty strings.
+
+    Checking that the *keys* exist is not enough: the agent model emits `"tail": null`
+    often enough to matter (3 times on a single golden_gate_bridge run), which satisfies
+    `'tail' in t` and then raises inside `clean_triplet` on `None.strip()`. That
+    exception escapes `extract_clean_special_terms` entirely, so one null discards every
+    well-formed triplet pooled from every batch of the same text — and on the seed path
+    it aborts `generate_response`, leaving the run with no graph at all. Dropping the one
+    bad triplet here keeps its siblings, and keeps which branches survive a property of
+    the text rather than of the model's luck in that batch.
+    """
+    if not isinstance(triplet, dict):
+        return False
+    return all(
+        isinstance(triplet.get(key), str) and triplet[key].strip() for key in _TRIPLET_KEYS
+    )
 
 def extract_triplets_from_text(text):
     triplets = []
