@@ -319,7 +319,19 @@ def process_triplet(conn, llm: ChatOpenAI, triplet, parent_term, depth, max_dept
                     logger.debug(f"Extracted {len(sub_triplets)} sub-triplets from description of '{tail}'")
                     MAX_BRANCHES = 2
                     if len(sub_triplets) > MAX_BRANCHES:
-                        logger.debug(f"Limiting sub-triplets for '{tail}' from {len(sub_triplets)} to {MAX_BRANCHES}.")
+                        # INFO, with both sides of the cut: the cap keeps the FIRST two by
+                        # list order, i.e. the two mined from the earliest sentences of the
+                        # description - not the two most relevant. On one run this discarded
+                        # 105 of 107. Whether that costs anything is only answerable by
+                        # reading what went, so log the kept pair in full and the discarded
+                        # tails, bounded.
+                        discarded = ", ".join(t["tail"] for t in sub_triplets[MAX_BRANCHES:])
+                        if len(discarded) > 600:
+                            discarded = discarded[:600] + " ..."
+                        logger.info(
+                            f"Branch cap for '{tail}': kept {MAX_BRANCHES} of {len(sub_triplets)}. "
+                            f"Kept: {sub_triplets[:MAX_BRANCHES]}. Discarded tails: {discarded}"
+                        )
                         sub_triplets = sub_triplets[:MAX_BRANCHES]
                     
                     if sub_triplets:
