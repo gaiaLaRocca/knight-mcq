@@ -32,7 +32,8 @@ text_splitter = RecursiveCharacterTextSplitter(
 )
 
 # Optional candidate-page scorers for disambiguation, injected by the thesis runner (kept
-# out of the fork so it stays pinnable). See docs/phase1_kb_quality_plan.md step 5b.3.
+# out of the fork so it stays pinnable). See docs/phase1_kb_quality_plan.md,
+# "Page selection: entity first, then topic".
 #
 # Selection is a two-stage, lexicographic rule, because "the right page" is two separate
 # questions that must not be summed into one score:
@@ -120,7 +121,7 @@ def get_wikipedia_chunks(llm: ChatOpenAI, term: str, context_hint: str | None = 
 
             # Legacy path uses the self-judging LLM title check as the filter. The ranked
             # path (scorer set) skips it and instead selects among the validated pages by
-            # entity relevance then topic relevance below (step 5b.3), removing that
+            # entity relevance then topic relevance below, removing that
             # circularity and the per-candidate LLM call.
             if scorer is None and not _is_title_relevant_llm(llm, term, page_title_guess, context_hint):
                 logger.debug(f"LLM relevance check failed for candidate '{page_title_guess}'. Skipping.")
@@ -397,8 +398,8 @@ Respond with only one word: "Yes" or "No".
 def _select_chunks(chunks: list[str], topic: str | None, max_chars: int, lead: str = "") -> list[str]:
     """Pick up to two de-duplicated chunks from one validated page, topic chunk first.
 
-    Implements the two-chunk rule of docs/phase1_kb_quality_plan.md (step 3,
-    "Chunk selection within a kept page"):
+    Implements the two-chunk rule of docs/phase1_kb_quality_plan.md ("Two chunks per
+    entity, and gate before selection"):
 
       1. topic chunk  -- the first chunk mentioning the topic (e.g. "golden gate
          bridge"): WHY the entity matters to the topic. Skipped when no topic is

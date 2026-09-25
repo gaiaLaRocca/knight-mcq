@@ -209,7 +209,7 @@ def create_relationship(conn, parent_term, child_term, relation="HAS_TERM"):
 def _is_wiki_fact_checked(conn, term) -> bool:
     """True iff the term's node is Wikipedia-grounded (wiki_fact_checked == 'Yes').
 
-    Recursion-gate helper (docs/phase1_kb_quality_plan.md step 5b.2): tails that are
+    Recursion-gate helper (docs/phase1_kb_quality_plan.md, "test_5 — acting upstream"): tails that are
     only LLM-described (no Wikipedia page) are ungrounded noise the downstream relevance
     gate prunes anyway, so their invented descriptions must not be mined for sub-triplets.
     On any query error, return False (conservative: do not recurse).
@@ -304,7 +304,7 @@ def process_triplet(conn, llm: ChatOpenAI, triplet, parent_term, depth, max_dept
         else:
             # Check if the tail term (which was processed above) is suitable for further exploration
             if tail in current_query_processed_terms: # Check if it was processed (it should have been)
-                # Recursion gate (docs/phase1_kb_quality_plan.md step 5b.2): only expand
+                # Recursion gate (docs/phase1_kb_quality_plan.md, "test_5 — acting upstream"): only expand
                 # Wikipedia-grounded tails. A non-fact-checked (LLM-only) tail is ungrounded
                 # noise the downstream relevance gate prunes anyway; mining sub-triplets from
                 # its invented description only multiplies that noise and the depth-2 cost.
