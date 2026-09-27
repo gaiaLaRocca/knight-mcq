@@ -7,6 +7,7 @@ import nltk
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from app.core.common.config import OPENAI_API_KEY, OPENAI_MODEL, OPENAI_API_BASE
+from app.core.agents.gpt.literals import is_literal, canonical_literal
 
 logger = logging.getLogger(__name__)
 
@@ -204,7 +205,9 @@ def normalize_node_name(name):
     name = name.strip().lower().replace("_", " ")
     name = _NON_DECIMAL_DOT.sub("", name)
     name = re.sub(r"\s+", " ", name).strip()
-    return _LEADING_ARTICLE.sub("", name)
+    name = _LEADING_ARTICLE.sub("", name)
+    # One value, one node: `may 27, 1937` and `may 27 1937` (see `canonical_literal`).
+    return canonical_literal(name) if is_literal(name) else name
 
 def clean_triplet(triplet):
     return {

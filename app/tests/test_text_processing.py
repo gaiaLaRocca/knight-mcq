@@ -23,7 +23,7 @@ class TestNormalizeNodeName(unittest.TestCase):
 
     def test_decimal_dots_kept(self):
         self.assertEqual(normalize_node_name("1.7 miles"), "1.7 miles")
-        self.assertEqual(normalize_node_name("2,743.2 meters"), "2,743.2 meters")
+        self.assertEqual(normalize_node_name("2,743.2 meters"), "2743.2 meters")  # literal: comma dropped
         self.assertEqual(normalize_node_name("1.7 * 5280 feet"), "1.7 * 5280 feet")
 
     def test_abbreviation_dots_removed(self):
@@ -38,8 +38,17 @@ class TestNormalizeNodeName(unittest.TestCase):
     def test_case_underscores_whitespace(self):
         self.assertEqual(normalize_node_name("  The_Golden  Gate\nBridge "), "golden gate bridge")
 
+    def test_literal_spellings_merge(self):
+        # Pairs observed on test_7 and earlier runs.
+        self.assertEqual(normalize_node_name("may 27, 1937"), normalize_node_name("may 27 1937"))
+        self.assertEqual(normalize_node_name("82,116 acres"), normalize_node_name("82116 acres"))
+        # A comma outside a literal is part of the name.
+        self.assertEqual(normalize_node_name("golden gate bridge, highway and transportation district"),
+                         "golden gate bridge, highway and transportation district")
+
     def test_idempotent(self):
-        for name in ["the golden gate bridge", "u.s. route 101", "1.7 miles", "The Hague"]:
+        for name in ["the golden gate bridge", "u.s. route 101", "1.7 miles", "The Hague",
+                     "May 27, 1937", "4,200 feet"]:
             once = normalize_node_name(name)
             self.assertEqual(normalize_node_name(once), once)
 

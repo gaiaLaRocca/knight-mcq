@@ -30,6 +30,7 @@ from app.core.common.config import (
 from app.core.common.neo4j_connection import Neo4jConnection
 from app.core.agents.gpt.text_processing import extract_clean_special_terms, extract_triplets_from_response, normalize_node_name
 from app.core.agents.gpt.term_description import query_term_description, generate_term_description, save_term_description
+from app.core.agents.gpt.literals import is_literal
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 # Import the new utility function
@@ -206,6 +207,25 @@ def create_relationship(conn, parent_term, child_term, relation="HAS_TERM"):
         logger.error(f"Failed to create relationship '{relation_clean}' from '{parent_clean}' to '{child_clean}': {e}")
 
 
+def record_literal_head(conn, literal, head):
+    """Append `head` to the `literal_heads` of the literal's node.
+
+    The heads are what the literal is verified against after the graph build, when every
+    head's Wikipedia text is available (the topic's is fetched only then). A list, because
+    one value can close triplets with different heads; duplicates are left for the reader
+    to collapse. Appending in a single SET keeps concurrent triplets from losing an update.
+    """
+    query = """
+    MERGE (t:Term {name: $literal})
+    SET t.literal_heads = coalesce(t.literal_heads, []) + $head
+    """
+    try:
+        conn.execute_write(query, parameters={"literal": literal, "head": head})
+        logger.info(f"Literal value '{literal}' recorded with head '{head}', to verify after the build.")
+    except Exception as e:
+        logger.error(f"Failed to record head '{head}' for literal value '{literal}': {e}")
+
+
 def _is_wiki_fact_checked(conn, term) -> bool:
     """True iff the term's node is Wikipedia-grounded (wiki_fact_checked == 'Yes').
 
@@ -255,9 +275,18 @@ def process_triplet(conn, llm: ChatOpenAI, triplet, parent_term, depth, max_dept
                 
             logger.debug(f"Marked term '{term}' as processed for this query.")
 
-            # Ensure the node exists 
-            save_term_as_node(conn, term) 
+            # Ensure the node exists
+            save_term_as_node(conn, term)
             # logger.debug(f"Ensured node exists for term: '{term}'") # Log in save_term_as_node is sufficient
+
+            # A literal value (date, measurement) is never looked up on Wikipedia, in either
+            # position: it has no page of its own, and page selection gives it one by chance
+            # (docs/phase1_kb_quality_plan.md, "Literal values take their chunks from the
+            # head entity, verified"). Its text and description come from its head, after
+            # the build; a literal in head position has no head and is dropped then.
+            if is_literal(term):
+                logger.info(f"'{term}' is a literal value: no Wikipedia lookup, no description yet.")
+                continue
 
             # Check/Generate/Save Description
             if not query_term_description(conn, term):
@@ -297,10 +326,17 @@ def process_triplet(conn, llm: ChatOpenAI, triplet, parent_term, depth, max_dept
         # Relationship within the triplet (head to tail)
         if head and tail and relation: # Only create if relation was specified
             create_relationship(conn, head, tail, final_relation) # Removed stats passing
+        # Only this function knows which head a literal tail belongs to; the Wikipedia
+        # lookup sees the term alone. Record it for the verification after the build.
+        if is_literal(tail) and head:
+            record_literal_head(conn, tail, head)
 
         # Recursive processing for the tail term
         if depth >= max_depth:
             logger.info(f"Maximum recursion depth {max_depth} reached for term '{tail}'. Skipping sub-triplet extraction.")
+        elif is_literal(tail):
+            # Its only text will be one sentence of its head's chunks: nothing to expand.
+            logger.info(f"'{tail}' is a literal value; skipping sub-triplet extraction.")
         else:
             # Check if the tail term (which was processed above) is suitable for further exploration
             if tail in current_query_processed_terms: # Check if it was processed (it should have been)
