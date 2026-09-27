@@ -6,6 +6,7 @@ import re # For splitting words
 from langchain.text_splitter import RecursiveCharacterTextSplitter # For chunking
 from langchain_openai import ChatOpenAI # To type hint the LLM
 from langchain_core.messages import HumanMessage, SystemMessage # For LLM prompt
+from app.core.agents.gpt.text_processing import normalize_node_name # "is this the topic?"
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +147,12 @@ def get_wikipedia_chunks(llm: ChatOpenAI, term: str, context_hint: str | None = 
             except Exception as e_val:
                  logger.warning(f"Unexpected error during wikipedia.page validation for '{page_title_guess}': {e_val}. Skipping candidate.")
                  continue # Try next candidate
+
+            # Before the band, not after: the topic's page is not a candidate at all, so the
+            # band must be measured from the best of the remaining titles.
+            if _is_topic_page_for_other_term(term, validated_title, topic):
+                logger.info(f"[wikipedia] excluded the topic's own page '{validated_title}' for non-topic term '{term}'.")
+                continue # Try next candidate
 
             if scorer is None:
                 # Legacy: the first valid, LLM-approved candidate that yields chunks wins,
@@ -321,6 +328,29 @@ def _fetch_and_select(validated_title: str, topic: str | None, max_chars: int,
         logger.debug(f"No suitable chunk found for page '{validated_title}'. Trying next candidate.")
         return [], ""
     return selected, opening or selected[0]
+
+
+def _is_topic_page_for_other_term(term: str, title: str, topic: str | None) -> bool:
+    """True if `title` is the topic's own page and `term` is not the topic.
+
+    Topic page excluded for non-topic terms (docs/phase1_kb_quality_plan.md, "Work plan for
+    test_8"). The topic's page is the closest page to the topic anchor by construction, so
+    for any term whose band contains it the topic tie-break returns it: on test_7
+    `golden gate strait` got *Golden Gate Bridge* (title 0.763, in band with *Golden Gate*
+    0.817; topic 0.8521 vs 0.8182), and so did `golden gate bridge design`. The entity then
+    carries the bridge's text in the KB and the KG, and its questions rest on the wrong page.
+    The topic's text is in the KB anyway, from its own per-section lookup.
+
+    Both comparisons run on normalised names, the key the KG uses for nodes. The topic's
+    page is recognised by its canonical title (redirects already resolved by validation), so
+    this assumes the topic label names its page, as `Golden Gate Bridge` does; the runner
+    warns when the topic's own lookup resolves to a differently named page. Inactive when no
+    topic is given (KNIGHT's own lookups).
+    """
+    if not topic:
+        return False
+    topic_key = normalize_node_name(topic)
+    return normalize_node_name(title) == topic_key and normalize_node_name(term) != topic_key
 
 
 def _entity_relevance_band(term: str, titles: list[str]) -> list[str]:
