@@ -73,8 +73,9 @@ def get_wikipedia_chunks(llm: ChatOpenAI, term: str, context_hint: str | None = 
     Legacy pipeline (no scorers injected), per candidate, first match wins:
         LLM Relevance Check -> Validation -> Fetch -> Chunk -> Select Chunks.
     Ranked pipeline (scorers injected, see the module globals):
-        Validation (all candidates) -> entity-relevance band -> Fetch/Chunk/Select the
-        in-band ones -> topic-relevance tie-break.
+        Validation (all candidates; a disambiguation page contributes its listed options
+        instead) -> entity-relevance band -> Fetch/Chunk/Select the in-band ones ->
+        topic-relevance tie-break.
     Returns the topic chunk and the entity chunk of the winning page (see `_select_chunks`),
     or its lead plus one chunk per body section when `per_section` is set.
 
@@ -116,6 +117,8 @@ def get_wikipedia_chunks(llm: ChatOpenAI, term: str, context_hint: str | None = 
         # of them, so validation is separated from the fetch. This also makes the ranked
         # path *cheaper* than before: only the in-band candidates are fetched and chunked.
         validated_candidates = []  # (validated_title, page_title_guess)
+        disambiguation_options = []  # ranked path: senses listed by disambiguation candidates
+        top_is_disambiguation = False
         for i, page_title_guess in enumerate(search_results):
             logger.debug(f"Attempting candidate {i+1}/{len(search_results)}: '{page_title_guess}'")
             validated_title = None # Reset for each candidate
@@ -134,6 +137,19 @@ def get_wikipedia_chunks(llm: ChatOpenAI, term: str, context_hint: str | None = 
                 validated_title = validated_page.title
                 logger.debug(f"[wikipedia] validation successful. Canonical title: '{validated_title}'")
             except wikipedia.exceptions.DisambiguationError as e:
+                if scorer is not None:
+                    # Disambiguation through page selection (docs/phase1_kb_quality_plan.md,
+                    # "Work plan for test_8"): the page's listed senses join the pool and go
+                    # through the same two stages as every search result. Stopping here, as
+                    # the legacy path does, lost `charles ellis` on test_7: a GGB engineer,
+                    # described from memory and then pruned, although the search itself had
+                    # returned 'Charles Alton Ellis' in fifth place. Options are only titles
+                    # for now; they are validated once they reach the band (`_validate_option`).
+                    top_is_disambiguation = top_is_disambiguation or i == 0
+                    new_options = [o for o in e.options if o not in disambiguation_options]
+                    disambiguation_options.extend(new_options)
+                    logger.info(f"[wikipedia] '{page_title_guess}' is a disambiguation page; {len(new_options)} option(s) join the candidates for '{term}': {new_options}")
+                    continue # Try next candidate
                 if i == 0:
                     logger.warning(f"[wikipedia] validation failed: Top search result '{page_title_guess}' for term '{term}' is ambiguous. Stopping lookup. Options: {e.options[:5]}...")
                     is_ambiguous = True # Set flag
@@ -166,13 +182,22 @@ def get_wikipedia_chunks(llm: ChatOpenAI, term: str, context_hint: str | None = 
 
             validated_candidates.append((validated_title, page_title_guess))
 
-        if scorer is not None and validated_candidates:
+        if scorer is not None and (validated_candidates or disambiguation_options):
             # --- Stage 2: entity-relevance band (does the page talk about the entity?) ---
-            band = _entity_relevance_band(term, [t for t, _ in validated_candidates])
+            validated_titles = [t for t, _ in validated_candidates]
+            pending_options = [o for o in disambiguation_options if o not in validated_titles]
+            pool = validated_titles + pending_options
+            band = _entity_relevance_band(term, pool)
 
             # --- Stage 3: topic tie-break inside the band (which sense of the entity?) ---
             ranked = []  # (topic_score, selected, validated_title)
+            fetched = set()
             for validated_title in band:
+                if validated_title in pending_options:
+                    validated_title = _validate_option(term, validated_title, topic)
+                if validated_title is None or validated_title in fetched:
+                    continue # Failed option, or a redirect onto a page already scored
+                fetched.add(validated_title)
                 selected, lead = _fetch_and_select(validated_title, topic, doc_content_chars_max, per_section)
                 if not selected:
                     continue # Try next in-band candidate
@@ -193,9 +218,12 @@ def get_wikipedia_chunks(llm: ChatOpenAI, term: str, context_hint: str | None = 
 
             if ranked:
                 best_score, best_selected, best_title = max(ranked, key=lambda c: c[0])
-                logger.info(f"Selected page '{best_title}' for term '{term}': entity band of {len(band)}/{len(validated_candidates)} candidate(s), topic-relevance={best_score:.4f}.")
+                logger.info(f"Selected page '{best_title}' for term '{term}': entity band of {len(band)}/{len(pool)} candidate(s), topic-relevance={best_score:.4f}.")
                 return best_selected, is_ambiguous, best_title
 
+        # Ranked path: report ambiguity as the legacy path did (top result a disambiguation
+        # page) only when no option produced a page either.
+        is_ambiguous = is_ambiguous or top_is_disambiguation
         logger.warning(f"Checked {len(search_results)} candidates for term '{term}', but found no relevant, valid page with usable chunks.")
         return [], is_ambiguous, None # Return [], False (or True if ambiguity stopped earlier)
 
@@ -351,6 +379,32 @@ def _is_topic_page_for_other_term(term: str, title: str, topic: str | None) -> b
         return False
     topic_key = normalize_node_name(topic)
     return normalize_node_name(title) == topic_key and normalize_node_name(term) != topic_key
+
+
+def _validate_option(term: str, option: str, topic: str | None) -> str | None:
+    """Canonical title of an in-band disambiguation option, or None if it cannot compete.
+
+    Validated only once it is inside the band, so a long list of senses (14 for
+    'Charles Ellis') costs one title embedding each and a page request only for the few
+    that plausibly name the entity. An option that is missing, or is itself a
+    disambiguation page, is skipped, never followed: one level of expansion. The topic's
+    own page is excluded here too, like any search result.
+    """
+    try:
+        title = wikipedia.page(option, auto_suggest=False).title
+    except wikipedia.exceptions.DisambiguationError:
+        logger.info(f"[wikipedia] option '{option}' for '{term}' is itself a disambiguation page; skipped, not followed.")
+        return None
+    except wikipedia.exceptions.PageError:
+        logger.info(f"[wikipedia] option '{option}' for '{term}' has no page; skipped.")
+        return None
+    except Exception as e:
+        logger.warning(f"[wikipedia] validation of option '{option}' for '{term}' failed: {e}. Skipped.")
+        return None
+    if _is_topic_page_for_other_term(term, title, topic):
+        logger.info(f"[wikipedia] excluded the topic's own page '{title}' for non-topic term '{term}'.")
+        return None
+    return title
 
 
 def _entity_relevance_band(term: str, titles: list[str]) -> list[str]:
