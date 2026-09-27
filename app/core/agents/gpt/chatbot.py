@@ -28,7 +28,7 @@ from app.core.common.config import (
     DEFAULT_ERROR_DESCRIPTION,
 )
 from app.core.common.neo4j_connection import Neo4jConnection
-from app.core.agents.gpt.text_processing import extract_clean_special_terms, extract_triplets_from_response
+from app.core.agents.gpt.text_processing import extract_clean_special_terms, extract_triplets_from_response, normalize_node_name
 from app.core.agents.gpt.term_description import query_term_description, generate_term_description, save_term_description
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
@@ -396,8 +396,9 @@ def generate_response(user_input, conn, max_depth):
         # Track terms processed within this specific query
         current_query_processed_terms = set()
         
-        # Ensure the initial user input term exists as a node
-        user_input_term = user_input.lower().strip()
+        # Ensure the initial user input term exists as a node. Same normalisation as every
+        # extracted head and tail, so the seed's mentions of the topic land on this node.
+        user_input_term = normalize_node_name(user_input)
         save_term_as_node(conn, user_input_term, response) # Save with description from LLM
         current_query_processed_terms.add(user_input_term) # Mark initial term as processed
         logger.info(f"Saved initial prompt term '{user_input_term}' and added to processed set for this query.")

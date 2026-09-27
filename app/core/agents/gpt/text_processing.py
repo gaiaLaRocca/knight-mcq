@@ -179,12 +179,52 @@ def remove_redundant_triplets(triplets):
     logger.debug(f"Removed redundant triplets. Unique triplets count: {len(unique_triplets)}")
     return unique_triplets
 
+# A leading "the" is the only article observed in the test_5-test_7 logs; "a"/"an" are
+# added only if they appear.
+_LEADING_ARTICLE = re.compile(r"^the\s+")
+# A dot is kept only between two digits: `u.s.` -> `us`, but `1.7 miles` must not become
+# `17 miles`.
+_NON_DECIMAL_DOT = re.compile(r"(?<!\d)\.|\.(?!\d)")
+
+def normalize_node_name(name):
+    """Canonical form of a node name: the Neo4j key every head and tail is saved under.
+
+    Node-name normalisation (docs/phase1_kb_quality_plan.md, "Work plan for test_8"). Without
+    it one entity reaches the KG under several names, and each is its own node with its own
+    lookup, description and edges: on test_7 `the golden gate bridge` held 5 seed triplets
+    beside the topic, `the san francisco peninsula` sat beside `san francisco peninsula`,
+    `u.s. route 101` beside `us route 101`. Questions then walk the duplicate instead of the
+    topic, or walk both.
+
+    Stripping "the" also changes the key of names where it belongs to the proper name
+    (*The Hague*); the Wikipedia search still resolves them. The function is idempotent, so
+    re-applying it downstream (`process_triplet`, `save_term_as_node`) is harmless, and the
+    thesis runner applies this same function to its join keys.
+    """
+    name = name.strip().lower().replace("_", " ")
+    name = _NON_DECIMAL_DOT.sub("", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return _LEADING_ARTICLE.sub("", name)
+
 def clean_triplet(triplet):
     return {
-        "head": triplet["head"].strip().lower().replace("_", " "),
+        "head": normalize_node_name(triplet["head"]),
         "relation": re.sub(r"\W|^(?=\d)", "_", triplet["relation"].strip().lower()),
-        "tail": triplet["tail"].strip().lower().replace("_", " ")
+        "tail": normalize_node_name(triplet["tail"])
     }
+
+def _drop_self_loops(triplets):
+    """Drop triplets whose head and tail are the same node.
+
+    Normalisation can make them: `the golden gate bridge -is-> golden gate bridge` was two
+    nodes and becomes one. A self-loop asserts nothing, and QA generation would walk it as a
+    path (test_7's q_017 walked the self-loop `san francisco -IS_A-> san francisco`).
+    """
+    kept = [t for t in triplets if t["head"] != t["tail"]]
+    if len(kept) < len(triplets):
+        loops = [t for t in triplets if t["head"] == t["tail"]]
+        logger.warning(f"Dropped {len(loops)} self-loop triplet(s) after name normalisation: {loops}")
+    return kept
 
 def extract_clean_special_terms(text):
     sentences = preprocess_text(text)
@@ -196,7 +236,7 @@ def extract_clean_special_terms(text):
         all_triplets.extend(triplets)
     if not all_triplets:
         all_triplets = extract_triplets_with_gpt(text)
-    clean_triplets = [clean_triplet(t) for t in all_triplets]
+    clean_triplets = _drop_self_loops([clean_triplet(t) for t in all_triplets])
     unique_triplets = remove_redundant_triplets(clean_triplets)
     logger.info(f"Extracted {len(unique_triplets)} unique triplets")
     return unique_triplets
