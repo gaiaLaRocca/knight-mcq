@@ -1,4 +1,5 @@
 import logging
+import re
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -20,6 +21,69 @@ logger = logging.getLogger("gpt_agent")
 # llm = ChatOpenAI(...) # Remove global instance if only used here
 
 processed_descriptions = set()  # Track processed descriptions globally
+
+# Replaces KNIGHT's 8-point template (definition, domains of use, subfields, mechanisms,
+# applications, case studies, related terms, current research). See
+# thesis-concept-robustness/docs/phase1_kb_quality_plan.md, "Node descriptions anchored to the
+# Wikipedia context". The template suits scientific concepts; for an entity such as Leon
+# Moisseiff or the Pacific Ocean it made the model fill sections from memory: on test_7 every
+# description ran 940-1,157 words from about 290 words of Wikipedia context, and questions
+# built on them had answers the KB cannot support. Every clause below has a reason:
+# - prose: nothing downstream parses the sections, and prose gives coreference an anaphoric
+#   chain to resolve, as the seed essay does;
+# - no preamble, definition first: the QA validator reads only the first 150 characters of a
+#   description, and on test_7 all 22 opened with "Okay, here's a detailed explanation...";
+# - about 300 words: parity with the context, not brevity. Questions are built from the
+#   descriptions and answered from the KB, so a note shorter than its source drops facts the
+#   chunks would support;
+# - stay close to the material: soft for now; a strict version waits for test_8's evidence.
+DESCRIPTION_SYSTEM_PROMPT = """You are a subject-matter expert writing short reference notes. Explain the term the user gives you in continuous prose: no lists, no headings, no markdown, and no preamble. Begin directly with a one-sentence definition of the term, then continue with what matters most about it.
+
+Write about 300 words. The reference material you are given is the primary source: stay close to what it says. Prefer concrete, checkable facts (names, places, dates, measurements, roles) over general commentary, and do not pad the note with background the material does not support. If the material is thin, write a shorter note instead of filling it out."""
+
+# The chatter a small model puts before the content despite being told not to. What marks it
+# is not the opening word but that it talks about the answer instead of the entity: an
+# optional interjection followed by an announcement ("Okay, here's...", "Okay, let's delve
+# into...", "Here is a note on..."). All 22 test_7 descriptions match. "Okay, Leon Moisseiff
+# was an engineer..." does not, and neither do Okayama or Hereford: facts are never dropped.
+_PREAMBLE = re.compile(
+    r"^(?:(?:okay|ok|sure|certainly|of course|alright|absolutely)[,.!]?\s+)?"
+    r"(?:here's|here’s|here is|let's|let’s|let me|i'll|i’ll|i will|below is)\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_preamble(text: str) -> str:
+    """Drop the announcement a small model puts before the content, and nothing else.
+
+    The prompt forbids the preamble; this enforces it, because the first 150 characters are
+    all the QA validator reads. Losing a fact costs more than keeping a preamble, so only text
+    that is certainly the announcement is removed, and the rest of the description is always
+    kept. When the first line announces the answer (see `_PREAMBLE`):
+
+    - with a colon, everything up to the colon goes and what follows it stays, on the same
+      line or below ("...the requested structure: **Term:** US Route 101...");
+    - without one, the line goes only if it is a single sentence with text after it;
+    - otherwise nothing is removed: "Okay, here's a note on X. X was an engineer..." keeps its
+      facts, and so does a preamble with "U.S." in it, whose sentence end cannot be told
+      from the abbreviation (an automatic sentence splitter cuts right after "U.S.").
+    """
+    text = text.strip()
+    first_line = text.split("\n", 1)[0]
+    match = _PREAMBLE.match(first_line)
+    if not match:
+        return text
+    if ":" in first_line:
+        cut = text.index(":") + 1
+    elif not re.search(r"[.!?]\s", first_line[match.end():].rstrip()):
+        cut = len(first_line)
+    else:
+        return text
+    rest = text[cut:].strip()
+    if not rest:
+        return text
+    logger.info(f"Dropped description preamble: {text[:cut].strip()[:200]!r}")
+    return rest
 
 @retry(
     stop=stop_after_attempt(3),
@@ -44,20 +108,7 @@ def generate_term_description(
         external_lookup = default_external_knowledge
     wikipedia_context_used = False
     try:
-        # Define the standard System Prompt (8-point structure)
-        base_prompt = """You are a subject-matter expert in a scientific field. Your task is to provide detailed, thorough, and academically structured explanations about terms provided by the user. Each term should be explained exhaustively using the following structure:
-
-1.  Definition and Scope – Provide a precise, scientific definition of the term. Outline its general scope, including the boundaries and extent of its meaning and use.
-2.  Domains of Use – Identify all relevant scientific, technical, or professional domains where this term plays a key role. Specify the fields in which this concept is critical and explain its importance in each.
-3.  Subfields and Disciplines – Break the term down into its major subfields, branches, or areas of study. Provide a brief but comprehensive overview of each subfield, including key principles, practices, and contributors.
-4.  Key Concepts and Mechanisms – Describe the most important ideas, mechanisms, or processes associated with this term in various contexts. Explain how these ideas interconnect.
-5.  Real-World Applications – Discuss the major practical applications of this concept in different spheres, such as industry, healthcare, environmental science, etc.
-6.  Case Studies and Examples – Provide specific case studies, examples, or practical demonstrations of the term in action. Show how it is applied in real-world scenarios.
-7.  Related and Overlapping Terms – Identify related or similar terms and concepts. Clarify how they are connected, and explain any subtle distinctions.
-8.  Current Research and Trends – Briefly cover the current research directions, innovations, and debates around this concept. Mention any ongoing advancements or challenges in the field.
-
-Your explanation should be clear, well-organized, scientifically accurate, and educational. Assume that the user is unfamiliar with the term, so explain each concept thoroughly. Use precise language and cite notable research, when possible. Dive deeply into subtopics as needed to provide a full understanding of the term's scope and implications.
-""" # <<< Ensure this closing triple quote is indented correctly
+        base_prompt = DESCRIPTION_SYSTEM_PROMPT
 
         # Call external knowledge lookup (default: Wikipedia), expecting tuple (summary, is_ambiguous)
         wikipedia_summary, is_ambiguous = external_lookup.lookup(
@@ -72,12 +123,13 @@ Your explanation should be clear, well-organized, scientifically accurate, and e
             logger.info(f"Found unambiguous Wikipedia context for '{term}'. Using it for LLM description generation.")
 
             # Construct Human Prompt for Wikipedia context case
-            task_instruction_wiki = f"Now, please apply the structured explanation approach defined in the system prompt to explain the term: '{term}'."
-            context_instruction_wiki = f"""Use the following Wikipedia context as the primary source for your explanation, structuring your response according to the system prompt guidelines:
+            task_instruction_wiki = f"Explain the term: '{term}'."
+            context_instruction_wiki = f"""Use the following Wikipedia context as the primary source for your explanation:
 --- Wikipedia Context ---
 {wikipedia_summary}
 --- End Wikipedia Context ---"""
-            parent_hint_wiki = f"Also consider its relationship to the parent term '{parent_term}'." if parent_term else ""
+            # Kept from KNIGHT: it is what yields the edge back to the parent.
+            parent_hint_wiki = f"Also explain how it relates to '{parent_term}'." if parent_term else ""
             human_prompt_content_wiki = f"{task_instruction_wiki}\n\n{context_instruction_wiki}\n\n{parent_hint_wiki}".strip()
 
             # Call the LLM with the standard System prompt and the specific Human prompt
@@ -96,16 +148,14 @@ Your explanation should be clear, well-organized, scientifically accurate, and e
                  logger.info(f"No suitable Wikipedia context found for '{term}'. Generating description using LLM and source context if available.")
 
             # *** START: Modified Fallback Prompt Handling ***
-            # Base Persona and Structure Prompt (Moved outside if/else)
-            # base_prompt = """ ... """
-
-            # Task Specific Instruction (for no-wiki case)
-            task_instruction = f"\n\nNow, please apply this structure to explain the term: '{term}'."
+            # Task Specific Instruction (for no-wiki case). Same system prompt: such a node is
+            # pruned as ungrounded before QA, so only the cost of a long answer is at stake.
+            task_instruction = f"Explain the term: '{term}'."
 
             # Add context if available (parent term or source text)
             context_hint = None
             if parent_term:
-                context_hint = f"Consider its relationship to the parent term '{parent_term}'."
+                context_hint = f"Also explain how it relates to '{parent_term}'."
             if source_context_text:
                 context_hint = (context_hint + "\n" if context_hint else "") + f"Additional context from source text: {source_context_text}"
 
@@ -117,16 +167,21 @@ Your explanation should be clear, well-organized, scientifically accurate, and e
             human_prompt_content = task_instruction
             
             # Invoke with separate System and Human messages
-            logger.debug(f"Generating description for '{term}' using structured prompt (System + Human). System Prompt: {system_prompt_content[:200]}... Human Prompt: {human_prompt_content[:300]}...")
+            logger.debug(f"Generating description for '{term}' without Wikipedia context (System + Human). System Prompt: {system_prompt_content[:200]}... Human Prompt: {human_prompt_content[:300]}...")
             response = llm.invoke([
                 SystemMessage(content=system_prompt_content),
                 HumanMessage(content=human_prompt_content)
             ]).content
             # *** END: Modified Fallback Prompt Handling ***
         
-        description = response.strip()
+        description = _strip_preamble(response)
         if description:
             logger.info(f"Generated description for term '{term}' (Wikipedia context: {'Yes' if wikipedia_context_used else 'No'})")
+            if wikipedia_context_used:
+                # The test_8 measurement: description length against the context it was
+                # written from (about 3.5x on test_7; the target is about 1x).
+                desc_words, ctx_words = len(description.split()), len(wikipedia_summary.split())
+                logger.info(f"Description length for '{term}': {desc_words} words from {ctx_words} words of Wikipedia context ({desc_words / max(ctx_words, 1):.1f}x).")
             return description, wikipedia_context_used
         else:
             logger.warning(f"No definition returned by LLM for term: '{term}'")
