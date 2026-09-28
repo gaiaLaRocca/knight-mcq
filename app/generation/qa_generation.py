@@ -81,7 +81,7 @@ Topic_Relevant: YES
 Ethics_Privacy_Safe: YES
 '''
 
-def generate_qa_from_graph(neo4j_conn, llm_client, max_complexity=2, exact_complexity=None, limit=None, skip_validation=False, validation_sample_rate=1.0, topic: str | None = None, generate_reverse: bool = False):
+def generate_qa_from_graph(neo4j_conn, llm_client, max_complexity=2, exact_complexity=None, limit=None, skip_validation=False, validation_sample_rate=1.0, topic: str | None = None, generate_reverse: bool = False, validation_report: dict | None = None):
     """
     Main function to orchestrate QA pair generation from graph paths.
     Uses ThreadPoolExecutor for concurrency within generate_qa_from_paths.
@@ -96,8 +96,9 @@ def generate_qa_from_graph(neo4j_conn, llm_client, max_complexity=2, exact_compl
     - validation_sample_rate: Between 0.0-1.0, percentage of items to validate.
     - topic: Optional string topic to keep QA pairs relevant to.
     - generate_reverse: If True, attempt to generate reverse QA pairs as well.
+    - validation_report: Optional dict, filled with the rejected pairs; see validate_qa_pairs.
     """
-    print("[Debug] Entered generate_qa_from_graph function.") 
+    print("[Debug] Entered generate_qa_from_graph function.")
     
     reverse_msg = " (Reverse QA Enabled)" if generate_reverse else ""
     topic_msg = f" (Topic: '{topic}')" if topic else ""
@@ -137,6 +138,10 @@ def generate_qa_from_graph(neo4j_conn, llm_client, max_complexity=2, exact_compl
     # --- Validation Section (operates on all_qa_pairs from paths) --- 
     logger.info(f"Total generated pairs before validation: {len(all_qa_pairs)}")
     print(f"Total pairs before validation: {len(all_qa_pairs)}")
+    if validation_report is not None:
+        validation_report["generated"] = len(all_qa_pairs)
+        validation_report.setdefault("rejected", [])
+        validation_report.setdefault("accepted_without_validation", [])
     
     validated_qa_pairs = all_qa_pairs 
     if not skip_validation and all_qa_pairs: 
@@ -144,7 +149,7 @@ def generate_qa_from_graph(neo4j_conn, llm_client, max_complexity=2, exact_compl
         print(f"Starting validation (sample rate={validation_sample_rate})...")
         start_time = time.time()
         # Pass topic to validation
-        validated_qa_pairs = validate_qa_pairs(all_qa_pairs, llm_client, sample_rate=validation_sample_rate, topic=topic)
+        validated_qa_pairs = validate_qa_pairs(all_qa_pairs, llm_client, sample_rate=validation_sample_rate, topic=topic, report=validation_report)
         duration = time.time() - start_time
         logger.info(f"Validation completed in {duration:.2f}s.")
         print(f"Validation completed in {duration:.2f}s.")
@@ -316,17 +321,63 @@ def parse_combined_validation_response(response_text):
         logger.warning(f"Could not parse 4-line validation response: '{response_text}'. Error: {e}")
         return False, False, False, False
 
-def validate_qa_pairs(qa_pairs, llm_client, sample_rate=1.0, topic: str | None = None):
+_VERDICT_KEYS = ("grammar_fluency", "answerable_from_source", "topic_relevant", "ethics_privacy_safe")
+
+
+def _verdict_is_complete(response_text):
+    """True if the validator's reply carries all four verdict lines.
+
+    `parse_combined_validation_response` reads a missing line as a failed check, so an
+    unparseable reply is rejected as if it had failed grammar, answerability and ethics. The
+    rejection stands; this only lets it be reported as what it is.
+    """
+    keys = {
+        line.split(":", 1)[0].strip().lower().replace(" ", "_")
+        for line in (response_text or "").splitlines() if ":" in line
+    }
+    return all(k in keys for k in _VERDICT_KEYS)
+
+
+def _record_rejection(report, index, pair, stage, failed_checks, raw_verdict=None):
+    """Append one rejected pair to `report["rejected"]`, when the caller asked for a report.
+
+    Rejections were only ever written with `logger.debug`, which never reaches the run log,
+    and with the question cut to 50 characters and no path. The record keeps what is needed
+    to judge the rejection afterwards: the pair's index in the generated list, the stage
+    (`structural` or `llm`), which checks failed, the pair itself and the raw verdict. See
+    thesis-concept-robustness/docs/phase1_kb_quality_plan.md, "QA generation and validation".
+    """
+    if report is None:
+        return
+    report.setdefault("rejected", []).append({
+        "index": index,
+        "stage": stage,
+        "failed_checks": failed_checks,
+        "question": pair.get("question"),
+        "answer": pair.get("answer"),
+        "source_details": pair.get("source_details"),
+        "raw_verdict": raw_verdict,
+    })
+
+
+def validate_qa_pairs(qa_pairs, llm_client, sample_rate=1.0, topic: str | None = None, report: dict | None = None):
     """
     Validates generated QA pairs for quality and correctness using ThreadPoolExecutor.
     Uses combined LLM check for grammar, answerability, and topic relevance.
-    
+
     Parameters:
     - qa_pairs: List of QA pairs to validate
     - llm_client: LLM client for validation
     - sample_rate: Float between 0.0-1.0, percentage of pairs to validate (1.0 = all)
     - topic: Optional string topic to check relevance against.
+    - report: Optional dict, filled in place when given: `rejected` (one record per rejected
+      pair, see `_record_rejection`) and `accepted_without_validation` (the questions kept
+      because their validation call timed out or failed). An argument rather than a second
+      return value, so KNIGHT's own callers are unaffected.
     """
+    if report is not None:
+        report.setdefault("rejected", [])
+        report.setdefault("accepted_without_validation", [])
     total_pairs = len(qa_pairs)
     topic_msg = f" against topic '{topic}'" if topic else ""
     logger.info(f"Starting validation for {total_pairs} generated QA pairs (sample rate: {sample_rate}){topic_msg}...")
@@ -369,6 +420,7 @@ def validate_qa_pairs(qa_pairs, llm_client, sample_rate=1.0, topic: str | None =
              else:
                  structurally_rejected_count += 1
                  logger.debug(f"Rejected pair #{idx} on structural check (LLM skipped): Reason(s): {'; '.join(rejection_reason)}.")
+                 _record_rejection(report, idx, pair, "structural", rejection_reason)
         
         # Add back non-sampled pairs if any
         if sample_rate < 1.0:
@@ -418,6 +470,7 @@ def validate_qa_pairs(qa_pairs, llm_client, sample_rate=1.0, topic: str | None =
                 # Log rejection based on structural checks immediately
                 rejected_count += 1
                 logger.debug(f"Rejected pair #{idx} pre-LLM check: Reason(s): {'; '.join(structural_rejection_reason)}. Q: {str(question)[:50]}...")
+                _record_rejection(report, idx, pair, "structural", structural_rejection_reason)
         
         logger.info(f"Submitted {pairs_submitted_to_llm} pairs (out of {num_to_validate} sampled) for LLM validation.")
 
@@ -427,35 +480,43 @@ def validate_qa_pairs(qa_pairs, llm_client, sample_rate=1.0, topic: str | None =
             pair = pairs_to_validate_map[original_idx] # Get the original pair data
             is_valid = True # Assume valid initially for LLM check part
             llm_rejection_reason = []
-            
+            failed_checks = []  # stable check names, for the report
+            validation_response_text = None
+
             try:
                 validation_response_text = future.result() # Get result from future
-                
+
                 if validation_response_text:
                     logger.debug(f"Raw validation response for pair #{original_idx}:\n---\n{validation_response_text}\n---")
                     grammar_ok, answerable_ok, topic_ok, ethics_ok = parse_combined_validation_response(validation_response_text)
-                    
+
                     # Apply all checks from the parser
-                    if not grammar_ok: is_valid = False; llm_rejection_reason.append("LLM grammar/clarity check failed")
-                    if not answerable_ok: is_valid = False; llm_rejection_reason.append(f"LLM answerability check failed")
-                    if not topic_ok: is_valid = False; llm_rejection_reason.append(f"LLM topic relevance check failed (Topic: '{topic}')")
-                    if not ethics_ok: is_valid = False; llm_rejection_reason.append(f"LLM ethics check failed")
+                    if not grammar_ok: is_valid = False; llm_rejection_reason.append("LLM grammar/clarity check failed"); failed_checks.append("grammar_fluency")
+                    if not answerable_ok: is_valid = False; llm_rejection_reason.append(f"LLM answerability check failed"); failed_checks.append("answerable_from_source")
+                    if not topic_ok: is_valid = False; llm_rejection_reason.append(f"LLM topic relevance check failed (Topic: '{topic}')"); failed_checks.append("topic_relevance")
+                    if not ethics_ok: is_valid = False; llm_rejection_reason.append(f"LLM ethics check failed"); failed_checks.append("ethics_privacy_safe")
+                    if not is_valid and not _verdict_is_complete(validation_response_text):
+                        failed_checks = ["unparseable_verdict"]
                 else:
                     logger.warning(f"MCQ Validation LLM call timed out or failed for pair #{original_idx}, accepting it anyway")
                     is_valid = True # Keep it valid if LLM call failed/timed out
+                    if report is not None:
+                        report["accepted_without_validation"].append(pair.get("question"))
 
             except Exception as exc:
                 logger.error(f"Error processing validation future for pair #{original_idx}: {exc}", exc_info=True)
                 is_valid = False # Reject if future processing itself fails
                 llm_rejection_reason.append(f"Future processing error: {exc}")
+                failed_checks = ["validation_error"]
 
-            # --- Decision based on LLM checks ---            
+            # --- Decision based on LLM checks ---
             processed_count += 1
             if is_valid:
                 validated_pairs_map[original_idx] = pair # Store accepted pair by index
             else:
                 rejected_count += 1
                 logger.debug(f"Rejected pair #{original_idx} post-LLM check: Reason(s): {'; '.join(llm_rejection_reason)}. Q: {pair.get('question', '')[:50]}...")
+                _record_rejection(report, original_idx, pair, "llm", failed_checks, validation_response_text)
 
             # Log progress
             if processed_count % progress_interval == 0 or processed_count == pairs_submitted_to_llm:
@@ -463,7 +524,10 @@ def validate_qa_pairs(qa_pairs, llm_client, sample_rate=1.0, topic: str | None =
                 logger.info(f"LLM Validation progress: {processed_count}/{pairs_submitted_to_llm} pairs completed ({progress_pct:.1f}%). Current rejected: {rejected_count}")
                 print(f"LLM Validation progress: {processed_count}/{pairs_submitted_to_llm} pairs completed ({progress_pct:.1f}%). Current rejected: {rejected_count}")
 
-    # --- Combine results --- 
+    # --- Combine results ---
+    if report is not None:
+        # Completion order is the thread pool's; generation order is reproducible.
+        report["rejected"].sort(key=lambda record: record["index"])
     final_validated_pairs = []
     # Add LLM-validated pairs in original order
     for idx in sorted(validated_pairs_map.keys()):
@@ -520,6 +584,15 @@ def _format_multihop_qa_prompt(path_data, topic: str | None = None):
     # 25 questions out of 25 opening with "Considering" — each one spending its opening
     # clause restating the path's first hop, which is the hop the question exists to make
     # the reader traverse.
+    #
+    # The model copies content as well as form, so every example comes from a domain
+    # unrelated to any Phase 1 topic. Examples 3 and 4 used to be about the Golden Gate
+    # Bridge, and on test_7 two answers repeated example 3's "caissons", a word found
+    # nowhere in the KB. They now show the association hop, one per way of reading it:
+    # example 3 uses it only to identify an entity, example 4 asks what the connection is;
+    # in both the answer comes from the node descriptions, never from the hop. Their
+    # openers differ so association questions have two forms to imitate, and neither is
+    # "How", already the opener of 19 of 21 questions on test_7.
     human_prompt = f"""Follow the instructions in the system prompt to generate an open-ended question and a concise free-form answer based on the provided path and node descriptions.
 
 PHRASING RULES (read carefully):
@@ -536,6 +609,10 @@ PHRASING RULES (read carefully):
 - The Question must be specifically about the subject of the Path, not a generic question
   that could apply to any bridge, city, or object. The answer must require the specific
   entities on this Path.
+- An ASSOCIATED_WITH step means the two entities appear together in the source, with no
+  relation stated between them. Do not invent one (do not turn it into "commanded",
+  "founded", "wrote" ...). Either ask what the connection is, answering from the node
+  descriptions, or use the step only to identify an entity ("the person associated with ...").
 
 Example 1:
 Path: (Paris)-[:CAPITAL_OF]->(France)-[:MEMBER_OF]->(European Union)
@@ -554,20 +631,20 @@ Question: What kind of concept is exemplified by a theme expressed in Hafiz's po
 Answer: An emotion.
 
 Example 3:
-Path: (depth of bay and strong currents)-[:INFLUENCED_OPERATION]->(Golden Gate Bridge)-[:LOCATED_AT]->(San Francisco Bay)
-Start Node: depth of bay and strong currents | Description: The bay is deep and its tidal currents are powerful.
-End Node: San Francisco Bay | Description: A large estuary on the coast of northern California.
+Path: (Apollo 11)-[:ASSOCIATED_WITH]->(Neil Armstrong)-[:BORN_IN]->(Wapakoneta)
+Start Node: Apollo 11 | Description: The 1969 spaceflight that first landed humans on the Moon.
+End Node: Wapakoneta | Description: A city in Auglaize County, Ohio, the birthplace of astronaut Neil Armstrong.
 
-Question: What did the deep water and powerful currents of San Francisco Bay force engineers to do when founding the Golden Gate Bridge?
-Answer: Sink massive caissons to the bay floor for stable foundations.
+Question: Which town was the birthplace of the astronaut associated with the Apollo 11 mission?
+Answer: Wapakoneta, Ohio.
 
 Example 4:
-Path: (Joseph Strauss)-[:CHIEF_ENGINEER_OF]->(Golden Gate Bridge)-[:OPENED_ON]->(May 27, 1937)
-Start Node: Joseph Strauss | Description: An engineer, born in Cincinnati, Ohio.
-End Node: May 27, 1937 | Description: The date the Golden Gate Bridge opened to the public.
+Path: (Penicillin)-[:ASSOCIATED_WITH]->(Alexander Fleming)
+Start Node: Penicillin | Description: The first antibiotic, discovered by Alexander Fleming in 1928.
+End Node: Alexander Fleming | Description: A Scottish physician and microbiologist who discovered penicillin in 1928.
 
-Question: When did the bridge built under Joseph Strauss as chief engineer open to the public?
-Answer: 27 May 1937.
+Question: What role did Alexander Fleming play in the history of penicillin?
+Answer: He discovered it, in 1928.
 
 {topic_instruction}
 
