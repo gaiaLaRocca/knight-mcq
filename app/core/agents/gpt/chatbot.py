@@ -27,7 +27,7 @@ from app.core.common.config import (
     DEFAULT_NO_DESCRIPTION,
     DEFAULT_ERROR_DESCRIPTION,
 )
-from app.core.common.neo4j_connection import Neo4jConnection
+from app.core.common.neo4j_connection import Neo4jConnection, ASSOCIATION_RELATION
 from app.core.agents.gpt.text_processing import extract_clean_special_terms, extract_triplets_from_response, normalize_node_name
 from app.core.agents.gpt.term_description import query_term_description, generate_term_description, save_term_description
 from app.core.agents.gpt.literals import is_literal
@@ -226,6 +226,34 @@ def record_literal_head(conn, literal, head):
         logger.error(f"Failed to record head '{head}' for literal value '{literal}': {e}")
 
 
+_DROP_REDUNDANT_ASSOCIATIONS_QUERY = f"""
+MATCH (p:Term)-[a:{ASSOCIATION_RELATION}]->(h:Term)
+WHERE EXISTS {{ MATCH (p)-[r]->(h) WHERE type(r) <> '{ASSOCIATION_RELATION}' }}
+DELETE a
+RETURN p.name AS parent, h.name AS head
+"""
+
+
+def _drop_redundant_associations(conn):
+    """Delete association edges running parallel to a stated relation.
+
+    On test_7 the seed gives both `golden gate bridge -spans-> golden gate strait` and
+    `golden gate strait -connects-> pacific ocean`; the second writes the association
+    `golden gate bridge -> golden gate strait` next to the real SPANS edge. Two edges between
+    the same nodes double every path through them, and so the questions. The association
+    exists only to connect a head the parent's text names without a stated relation, so where
+    a relation is stated it adds nothing. Run once the build is over: triplets are processed
+    in parallel, so when the association is written the real edge may not exist yet.
+    """
+    try:
+        rows = conn.query(_DROP_REDUNDANT_ASSOCIATIONS_QUERY) or []
+        if rows:
+            pairs = ", ".join(f"{r['parent']} -> {r['head']}" for r in rows)
+            logger.info(f"Dropped {len(rows)} association edge(s) parallel to a stated relation: {pairs}")
+    except Exception as e:
+        logger.error(f"Failed to drop redundant association edges: {e}")
+
+
 def _is_wiki_fact_checked(conn, term) -> bool:
     """True iff the term's node is Wikipedia-grounded (wiki_fact_checked == 'Yes').
 
@@ -320,9 +348,20 @@ def process_triplet(conn, llm: ChatOpenAI, triplet, parent_term, depth, max_dept
 
         # Create Relationships (Nodes are guaranteed to exist by MERGE in save_term_as_node)
         final_relation = relation.upper() if relation else "HAS_TERM"
-        # Relationship from parent (from previous level) to current tail
-        if parent_term and tail:
-             create_relationship(conn, parent_term, tail, final_relation) # Removed stats passing
+        # Association edge from the parent (the node whose text this triplet was mined from)
+        # to the head, replacing KNIGHT's parent edge `parent -[relation]-> tail`. That edge
+        # borrowed the child's relation and so asserted what the text never said:
+        # `golden gate bridge -CONNECTS-> pacific ocean` (the strait connects them),
+        # `san francisco -IS_A-> san francisco`, and `golden gate bridge -SERVED_AS-> chief
+        # engineer`, which left Joseph Strauss hanging from a role and orphaned him. Its only
+        # job was connectivity: a triplet whose head is not the parent (`leon moisseiff
+        # -contributed_to-> golden gate bridge design`, from the seed) would otherwise float
+        # free and be orphan-pruned. The association edge keeps that job and asserts only
+        # what is true by construction: the head appears in the parent's text. The tail stays
+        # connected through the real head -> tail edge below. See
+        # docs/phase1_kb_quality_plan.md, "Relation hygiene: parent edges".
+        if parent_term and head and head != parent_term:
+            create_relationship(conn, parent_term, head, ASSOCIATION_RELATION)
         # Relationship within the triplet (head to tail)
         if head and tail and relation: # Only create if relation was specified
             create_relationship(conn, head, tail, final_relation) # Removed stats passing
@@ -457,6 +496,7 @@ def generate_response(user_input, conn, max_depth):
                     except Exception as e:
                          # Log error including the specific triplet that failed
                         logger.error(f"Error processing top-level triplet {triplet_info}: {e}", exc_info=True)
+            _drop_redundant_associations(conn)
             # --- Timing End & Log ---
             duration = time() - start_time
             logger.info(f"Triplet processing and graph building took {duration:.2f}s.")

@@ -4,6 +4,12 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# The edge from the node whose text was mined (P) to the head of a triplet extracted from it.
+# It asserts only that the head appears in P's text. Written by `process_triplet` (chatbot.py);
+# `find_paths` allows at most one per path. See thesis-concept-robustness/docs/
+# phase1_kb_quality_plan.md, "Relation hygiene: parent edges".
+ASSOCIATION_RELATION = "ASSOCIATED_WITH"
+
 class Neo4jConnection:
     def __init__(self, uri, user, pwd):
         self._uri = uri
@@ -145,16 +151,23 @@ class Neo4jConnection:
             log_length_msg = f"up to length {max_length}"
             
         logger.info(f"Finding paths with {log_length_msg}...")
-        
+
+        # At most one association hop per path: a path made only of them (topic -> A -> B,
+        # neither link stated) leaves the question nothing to be about.
+        association_filter = (
+            f"AND size([rel IN relationships(p) WHERE type(rel) = '{ASSOCIATION_RELATION}']) <= 1"
+        )
+
         # Construct the query using the determined pattern
         # Note: Parameterizing the variable length part (`[*N]`) directly is complex/not standard.
         # Building the string is common practice here.
         if exact_length is not None:
              # Cypher for exact length
             cypher_query = f"""
-            MATCH p=(start_node:Term)-[r*{exact_length}]->(end_node:Term) 
+            MATCH p=(start_node:Term)-[r*{exact_length}]->(end_node:Term)
             WHERE start_node <> end_node
-            RETURN 
+            {association_filter}
+            RETURN
                 [node IN nodes(p) | {{name: node.name, description: node.description, fact_checked: node.wiki_fact_checked}}] AS path_nodes,
                 [rel IN relationships(p) | type(rel)] AS path_relationships
             LIMIT {query_limit}
@@ -162,9 +175,10 @@ class Neo4jConnection:
         else:
             # Cypher for max length
             cypher_query = f"""
-            MATCH p=(start_node:Term)-[r*1..{int(max_length)}]->(end_node:Term) 
+            MATCH p=(start_node:Term)-[r*1..{int(max_length)}]->(end_node:Term)
             WHERE start_node <> end_node
-            RETURN 
+            {association_filter}
+            RETURN
                 [node IN nodes(p) | {{name: node.name, description: node.description, fact_checked: node.wiki_fact_checked}}] AS path_nodes,
                 [rel IN relationships(p) | type(rel)] AS path_relationships
             LIMIT {query_limit}
