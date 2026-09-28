@@ -118,7 +118,7 @@ class Neo4jConnection:
             logger.error(f"Error fetching node details: {e}")
             return []
 
-    def find_paths(self, max_length=2, exact_length=None):
+    def find_paths(self, max_length=2, exact_length=None, start_name=None):
         """Finds paths in the graph.
 
         If exact_length is specified, finds paths with exactly that many relationships.
@@ -127,6 +127,13 @@ class Neo4jConnection:
         Args:
             max_length (int): Max relationships if exact_length is None.
             exact_length (int | None): Exact number of relationships, or None.
+            start_name (str | None): When set, only paths starting at the node with exactly
+                this name. Without it, a path may start at any node: on test_7, 23 of the 49
+                paths did (`marin county -> san francisco bay area`, `leon moisseiff ->
+                golden gate bridge design`...), and 6 of the 21 surviving questions never
+                named the bridge, while every path still costs two model calls. See
+                thesis-concept-robustness/docs/phase1_kb_quality_plan.md, "Paths enumerated
+                from the topic only".
 
         Returns:
             list: List of path dictionaries, or empty list on error.
@@ -150,6 +157,10 @@ class Neo4jConnection:
             path_length_pattern = f"[*1..{int(max_length)}]"
             log_length_msg = f"up to length {max_length}"
             
+        # The start is bound by a parameter, never interpolated: node names are model output.
+        start_pattern = "(start_node:Term {name: $start_name})" if start_name else "(start_node:Term)"
+        if start_name:
+            log_length_msg += f", starting at '{start_name}'"
         logger.info(f"Finding paths with {log_length_msg}...")
 
         # At most one association hop per path: a path made only of them (topic -> A -> B,
@@ -164,7 +175,7 @@ class Neo4jConnection:
         if exact_length is not None:
              # Cypher for exact length
             cypher_query = f"""
-            MATCH p=(start_node:Term)-[r*{exact_length}]->(end_node:Term)
+            MATCH p={start_pattern}-[r*{exact_length}]->(end_node:Term)
             WHERE start_node <> end_node
             {association_filter}
             RETURN
@@ -175,7 +186,7 @@ class Neo4jConnection:
         else:
             # Cypher for max length
             cypher_query = f"""
-            MATCH p=(start_node:Term)-[r*1..{int(max_length)}]->(end_node:Term)
+            MATCH p={start_pattern}-[r*1..{int(max_length)}]->(end_node:Term)
             WHERE start_node <> end_node
             {association_filter}
             RETURN
@@ -185,7 +196,7 @@ class Neo4jConnection:
             """
         
         try:
-            results = self.query(cypher_query)
+            results = self.query(cypher_query, parameters={"start_name": start_name} if start_name else None)
             if results is not None:
                 paths = []
                 for record in results:

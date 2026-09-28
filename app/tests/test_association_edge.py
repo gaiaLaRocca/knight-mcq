@@ -58,16 +58,39 @@ class TestAssociationEdge(unittest.TestCase):
 
 class TestFindPathsShape(unittest.TestCase):
     def _query_for(self, **kwargs):
-        conn = object.__new__(Neo4jConnection)  # no driver: only the query text is inspected
+        """(cypher, parameters) that find_paths sends; no driver, only the query is inspected."""
+        conn = object.__new__(Neo4jConnection)
         captured = []
-        conn.query = lambda cypher, *a, **k: captured.append(cypher) or []
+        conn.query = lambda cypher, parameters=None, **k: captured.append((cypher, parameters)) or []
         conn.find_paths(**kwargs)
         return captured[0]
 
     def test_at_most_one_association_hop(self):
         expected = f"size([rel IN relationships(p) WHERE type(rel) = '{ASSOCIATION_RELATION}']) <= 1"
-        self.assertIn(expected, self._query_for(max_length=2))
-        self.assertIn(expected, self._query_for(exact_length=2))
+        self.assertIn(expected, self._query_for(max_length=2)[0])
+        self.assertIn(expected, self._query_for(exact_length=2)[0])
+
+    def test_start_bound_to_the_named_node_by_parameter(self):
+        for kwargs in ({"max_length": 2}, {"exact_length": 2}):
+            cypher, params = self._query_for(start_name="golden gate bridge", **kwargs)
+            self.assertIn("MATCH p=(start_node:Term {name: $start_name})-", cypher)
+            self.assertEqual(params, {"start_name": "golden gate bridge"})
+
+    def test_without_start_any_node_can_start(self):
+        cypher, params = self._query_for(max_length=2)
+        self.assertIn("MATCH p=(start_node:Term)-", cypher)
+        self.assertIsNone(params)
+
+
+class TestPathsFromTopic(unittest.TestCase):
+    def test_qa_generation_starts_paths_at_the_topic_node(self):
+        from unittest.mock import MagicMock
+        from app.generation.qa_generation import generate_qa_from_paths
+        conn = MagicMock()
+        conn.find_paths.return_value = []
+        generate_qa_from_paths(conn, llm_client=None, max_complexity=2, topic="Golden Gate Bridge")
+        conn.find_paths.assert_called_once_with(
+            max_length=2, exact_length=None, start_name="golden gate bridge")
 
 
 if __name__ == "__main__":

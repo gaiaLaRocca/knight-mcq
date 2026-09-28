@@ -8,6 +8,7 @@ import random
 import uuid # <-- Import uuid
 import re # <-- Import re
 from langchain_core.messages import SystemMessage, HumanMessage # <-- Ensure imports
+from app.core.agents.gpt.text_processing import normalize_node_name
 
 logger = logging.getLogger(__name__)
 
@@ -842,9 +843,16 @@ def generate_qa_from_paths(neo4j_conn, llm_client, max_complexity=2, exact_compl
         t_start_paths = time.time()
         # Pass exact_complexity directly to find_paths
         logger.info(f"--> Attempting to fetch paths ({complexity_mode})...")
-        paths_data = neo4j_conn.find_paths(max_length=max_complexity, exact_length=exact_complexity)
+        # With a topic, paths start at the topic node only, so every question walks outward
+        # from the concept under test. The node is named by the same normalisation as every
+        # node in the graph ("Golden Gate Bridge" -> "golden gate bridge").
+        start_name = normalize_node_name(topic) if topic else None
+        paths_data = neo4j_conn.find_paths(max_length=max_complexity, exact_length=exact_complexity, start_name=start_name)
         t_dur_paths = time.time() - t_start_paths
         logger.info(f"<-- Fetched {len(paths_data) if paths_data else 0} paths in {t_dur_paths:.2f}s ({complexity_mode}).")
+        # print, like this module's other run-level lines: its logger does not reach the run log.
+        start_msg = f"starting at '{start_name}'" if start_name else "starting at any node"
+        print(f"Found {len(paths_data) if paths_data else 0} paths ({complexity_mode}), {start_msg}.")
         
         if not paths_data:
             logger.warning(f"No paths found ({complexity_mode}).")
