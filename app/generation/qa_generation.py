@@ -935,8 +935,11 @@ def generate_qa_from_paths(neo4j_conn, llm_client, max_complexity=2, exact_compl
             logger.warning(f"No paths found ({complexity_mode}).")
             return []
 
-        # --- REMOVED Python filtering --- 
-        
+        paths_data, duplicates = _one_path_per_node_sequence(paths_data)
+        if duplicates:
+            print(f"Dropped {len(duplicates)} path(s) repeating the node sequence of another: "
+                  + "; ".join(_path_label(path) for path in duplicates))
+
         paths_to_process = paths_data
         process_limit_msg = "all available"
         if limit is not None and limit > 0 and limit < len(paths_data):
@@ -976,4 +979,34 @@ def generate_qa_from_paths(neo4j_conn, llm_client, max_complexity=2, exact_compl
         logger.error(f"An error occurred during CONCURRENT QA generation from paths: {e}", exc_info=True)
 
     logger.info(f"Finished generating {len(all_generated_pairs)} QA pairs from paths ({complexity_mode}, Limit Applied: {limit is not None}, Processed Count: {process_count}{topic_msg}{reverse_msg}).")
-    return all_generated_pairs 
+    return all_generated_pairs
+
+
+def _one_path_per_node_sequence(paths):
+    """Keep one path per sequence of nodes; return (kept, dropped), kept in first-seen order.
+
+    Two edges between the same nodes double every path through them, and the questions
+    written on the copies share their answer: on test_8, `golden gate strait -CONNECTS->`
+    and `-CONNECTS_TO-> pacific ocean` gave q_010 and q_012. Of the copies, the one whose
+    relationships sort first is kept, so the choice does not depend on the order Neo4j
+    returns paths in. See thesis-concept-robustness/docs/phase1_kb_quality_plan.md,
+    "Paths de-duplicated by node sequence".
+    """
+    groups = {}
+    for path in paths:
+        sequence = tuple(node["name"] for node in path["nodes"])
+        groups.setdefault(sequence, []).append(path)
+    kept, dropped = [], []
+    for copies in groups.values():
+        copies = sorted(copies, key=lambda path: path["relationships"])
+        kept.append(copies[0])
+        dropped.extend(copies[1:])
+    return kept, dropped
+
+
+def _path_label(path):
+    """`(a)-[:R]->(b)`, the notation of the generation prompt."""
+    label = f"({path['nodes'][0]['name']})"
+    for relationship, node in zip(path["relationships"], path["nodes"][1:]):
+        label += f"-[:{relationship}]->({node['name']})"
+    return label
