@@ -104,6 +104,33 @@ class _WikiGroundingStats:
 
 wiki_stats = _WikiGroundingStats()
 
+
+class _ExpandedTerms:
+    """The terms whose descriptions were already mined for sub-triplets in this build.
+
+    A node reached by several triplets used to be expanded once per triplet: on test_8
+    `suspension bridge` three times and `golden gate bridge design` twice, each a model call
+    that can mine the same facts again under other verbs. Triplets run in parallel, so the
+    check and the mark are one step under the lock. Reset at the start of each run.
+    """
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._terms = set()
+
+    def reset(self):
+        with self._lock:
+            self._terms.clear()
+
+    def claim(self, term) -> bool:
+        """Mark `term` as expanded; False if it already was, and the caller must not expand it."""
+        with self._lock:
+            if term in self._terms:
+                return False
+            self._terms.add(term)
+            return True
+
+expanded_terms = _ExpandedTerms()
+
 # LLM lazy-initialized so tests can import without OPENAI_* env (see _get_llm below)
 _llm_cache = None
 
@@ -360,7 +387,8 @@ def process_triplet(conn, llm: ChatOpenAI, triplet, parent_term, depth, max_dept
         # what is true by construction: the head appears in the parent's text. The tail stays
         # connected through the real head -> tail edge below. See
         # docs/phase1_kb_quality_plan.md, "Relation hygiene: parent edges".
-        if parent_term and head and head != parent_term:
+        attached_by_association = bool(parent_term and head and head != parent_term)
+        if attached_by_association:
             create_relationship(conn, parent_term, head, ASSOCIATION_RELATION)
         # Relationship within the triplet (head to tail)
         if head and tail and relation: # Only create if relation was specified
@@ -370,62 +398,13 @@ def process_triplet(conn, llm: ChatOpenAI, triplet, parent_term, depth, max_dept
         if is_literal(tail) and head:
             record_literal_head(conn, tail, head)
 
-        # Recursive processing for the tail term
-        if depth >= max_depth:
-            logger.info(f"Maximum recursion depth {max_depth} reached for term '{tail}'. Skipping sub-triplet extraction.")
-        elif is_literal(tail):
-            # Its only text will be one sentence of its head's chunks: nothing to expand.
-            logger.info(f"'{tail}' is a literal value; skipping sub-triplet extraction.")
-        else:
-            # Check if the tail term (which was processed above) is suitable for further exploration
-            if tail in current_query_processed_terms: # Check if it was processed (it should have been)
-                # Recursion gate (docs/phase1_kb_quality_plan.md, "test_5 — acting upstream"): only expand
-                # Wikipedia-grounded tails. A non-fact-checked (LLM-only) tail is ungrounded
-                # noise the downstream relevance gate prunes anyway; mining sub-triplets from
-                # its invented description only multiplies that noise and the depth-2 cost.
-                # Grounded, on-topic tails still expand, so multi-hop branches survive.
-                if not _is_wiki_fact_checked(conn, tail):
-                    logger.info(f"Recursion gate: '{tail}' is not Wikipedia-fact-checked; skipping sub-triplet extraction.")
-                    tail_description = None
-                else:
-                    tail_description = query_term_description(conn, tail)
-                if tail_description and tail_description not in [DEFAULT_NO_DESCRIPTION, DEFAULT_ERROR_DESCRIPTION]:
-                    sub_triplets = extract_clean_special_terms(tail_description) # Assuming this function extracts triplets correctly
-                    logger.debug(f"Extracted {len(sub_triplets)} sub-triplets from description of '{tail}'")
-                    MAX_BRANCHES = 2
-                    if len(sub_triplets) > MAX_BRANCHES:
-                        # INFO, with both sides of the cut: the cap keeps the FIRST two by
-                        # list order, i.e. the two mined from the earliest sentences of the
-                        # description - not the two most relevant. On one run this discarded
-                        # 105 of 107. Whether that costs anything is only answerable by
-                        # reading what went, so log the kept pair in full and the discarded
-                        # tails, bounded.
-                        discarded = ", ".join(t["tail"] for t in sub_triplets[MAX_BRANCHES:])
-                        if len(discarded) > 600:
-                            discarded = discarded[:600] + " ..."
-                        logger.info(
-                            f"Branch cap for '{tail}': kept {MAX_BRANCHES} of {len(sub_triplets)}. "
-                            f"Kept: {sub_triplets[:MAX_BRANCHES]}. Discarded tails: {discarded}"
-                        )
-                        sub_triplets = sub_triplets[:MAX_BRANCHES]
-                    
-                    if sub_triplets:
-                        # Use a ThreadPoolExecutor for concurrent processing of sub-triplets
-                        with ThreadPoolExecutor(max_workers=5) as executor:
-                            # Pass original_response_text down in recursive calls
-                            futures = {executor.submit(process_triplet, conn, _get_llm(), st, tail, depth + 1, max_depth, current_query_processed_terms, original_response_text): st for st in sub_triplets} # Removed stats passing
-                            for future in as_completed(futures):
-                                sub_triplet_info = futures[future]
-                                try:
-                                    future.result() # Wait for completion, handle exceptions
-                                except Exception as e:
-                                    logger.error(f"Error processing sub-triplet derived from '{tail}' (Triplet: {sub_triplet_info}): {e}", exc_info=True)
-                    else:
-                        logger.debug(f"No sub-triplets extracted from description of '{tail}'.")
-                else:
-                    logger.debug(f"No valid description available for '{tail}' to extract sub-triplets.")
-            else:
-                 logger.warning(f"Term '{tail}' was not marked as processed, skipping sub-triplet extraction. This might indicate an issue.")
+        _expand_node(conn, tail, depth, max_depth, current_query_processed_terms, original_response_text)
+        # A head attached by an association edge sits as close to the parent as the tail does,
+        # yet only tails used to be expanded: on test_8 Strauss, Ellis, Morrow and Moisseiff,
+        # the people the seed names, got no sub-triplet of their own, while `chief engineer`
+        # did. See docs/phase1_kb_quality_plan.md, "Association heads expanded".
+        if attached_by_association:
+            _expand_node(conn, head, depth, max_depth, current_query_processed_terms, original_response_text)
 
     except Exception as e:
         # Log details including the triplet being processed when the error occurred
@@ -433,6 +412,69 @@ def process_triplet(conn, llm: ChatOpenAI, triplet, parent_term, depth, max_dept
         logger.error(f"Unexpected error processing triplet ({triplet_info}) at depth {depth}: {e}", exc_info=True)
         # Decide if we should raise or just log and continue
         # raise # Uncomment if errors should halt processing for the parent
+
+def _expand_node(conn, term, depth, max_depth, current_query_processed_terms, original_response_text):
+    """Mine `term`'s description for sub-triplets and process them one level deeper.
+
+    `depth` is the level of the triplet that reached `term`. Each term is expanded at most
+    once per build (`expanded_terms`), whether it was reached as a tail or as a head.
+    """
+    if depth >= max_depth:
+        logger.info(f"Maximum recursion depth {max_depth} reached for term '{term}'. Skipping sub-triplet extraction.")
+        return
+    if is_literal(term):
+        # Its only text will be one sentence of its head's chunks: nothing to expand.
+        logger.info(f"'{term}' is a literal value; skipping sub-triplet extraction.")
+        return
+    if term not in current_query_processed_terms:
+        logger.warning(f"Term '{term}' was not marked as processed, skipping sub-triplet extraction. This might indicate an issue.")
+        return
+    # Recursion gate (docs/phase1_kb_quality_plan.md, "test_5 — acting upstream"): only expand
+    # Wikipedia-grounded terms. A non-fact-checked (LLM-only) term is ungrounded noise the
+    # downstream relevance gate prunes anyway; mining sub-triplets from its invented
+    # description only multiplies that noise and the depth-2 cost.
+    if not _is_wiki_fact_checked(conn, term):
+        logger.info(f"Recursion gate: '{term}' is not Wikipedia-fact-checked; skipping sub-triplet extraction.")
+        return
+    description = query_term_description(conn, term)
+    if not description or description in [DEFAULT_NO_DESCRIPTION, DEFAULT_ERROR_DESCRIPTION]:
+        logger.debug(f"No valid description available for '{term}' to extract sub-triplets.")
+        return
+    # Claimed only here, once the term is known to be expandable: a check that failed because
+    # another thread had not yet written the description must not use up the expansion.
+    if not expanded_terms.claim(term):
+        logger.debug(f"'{term}' already expanded in this build; skipping sub-triplet extraction.")
+        return
+
+    sub_triplets = extract_clean_special_terms(description)
+    logger.debug(f"Extracted {len(sub_triplets)} sub-triplets from description of '{term}'")
+    MAX_BRANCHES = 2
+    if len(sub_triplets) > MAX_BRANCHES:
+        # INFO, with both sides of the cut: the cap keeps the FIRST two by list order, i.e.
+        # the two mined from the earliest sentences of the description - not the two most
+        # relevant. On one run this discarded 105 of 107. Whether that costs anything is only
+        # answerable by reading what went, so log the kept pair in full and the discarded
+        # tails, bounded.
+        discarded = ", ".join(t["tail"] for t in sub_triplets[MAX_BRANCHES:])
+        if len(discarded) > 600:
+            discarded = discarded[:600] + " ..."
+        logger.info(
+            f"Branch cap for '{term}': kept {MAX_BRANCHES} of {len(sub_triplets)}. "
+            f"Kept: {sub_triplets[:MAX_BRANCHES]}. Discarded tails: {discarded}"
+        )
+        sub_triplets = sub_triplets[:MAX_BRANCHES]
+    if not sub_triplets:
+        logger.debug(f"No sub-triplets extracted from description of '{term}'.")
+        return
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(process_triplet, conn, _get_llm(), st, term, depth + 1, max_depth, current_query_processed_terms, original_response_text): st for st in sub_triplets}
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                logger.error(f"Error processing sub-triplet derived from '{term}' (Triplet: {futures[future]}): {e}", exc_info=True)
+
 
 def generate_llm_response(user_input):
     """
@@ -464,6 +506,7 @@ def generate_response(user_input, conn, max_depth):
     try:
         # Reset Wikipedia-grounding stats for this run
         wiki_stats.reset()
+        expanded_terms.reset()
 
         response = generate_llm_response(user_input)
         triplets = extract_triplets_from_response(response)
