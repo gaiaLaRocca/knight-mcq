@@ -27,3 +27,4 @@ src2/
 # Miscellaneous
 Archive/
 depth/
+*.egg-info/
