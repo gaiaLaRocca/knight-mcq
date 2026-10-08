@@ -31,6 +31,7 @@ from app.core.common.neo4j_connection import Neo4jConnection, ASSOCIATION_RELATI
 from app.core.agents.gpt.text_processing import extract_clean_special_terms, extract_triplets_from_response, normalize_node_name
 from app.core.agents.gpt.term_description import query_term_description, generate_term_description, save_term_description
 from app.core.agents.gpt.literals import is_literal
+from app.core.agents.gpt import branch_selection
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 # Import the new utility function
@@ -130,6 +131,10 @@ class _ExpandedTerms:
             return True
 
 expanded_terms = _ExpandedTerms()
+
+# The topic and every node the seed triplets name, set at the start of each build and only
+# read afterwards. A branch never ends on one of them (`branch_selection.select_branches`).
+seed_nodes = frozenset()
 
 # LLM lazy-initialized so tests can import without OPENAI_* env (see _get_llm below)
 _llm_cache = None
@@ -448,32 +453,37 @@ def _expand_node(conn, term, depth, max_depth, current_query_processed_terms, or
 
     sub_triplets = extract_clean_special_terms(description)
     logger.debug(f"Extracted {len(sub_triplets)} sub-triplets from description of '{term}'")
-    MAX_BRANCHES = 2
-    if len(sub_triplets) > MAX_BRANCHES:
-        # INFO, with both sides of the cut: the cap keeps the FIRST two by list order, i.e.
-        # the two mined from the earliest sentences of the description - not the two most
-        # relevant. On one run this discarded 105 of 107. Whether that costs anything is only
-        # answerable by reading what went, so log the kept pair in full and the discarded
-        # tails, bounded.
-        discarded = ", ".join(t["tail"] for t in sub_triplets[MAX_BRANCHES:])
-        if len(discarded) > 600:
-            discarded = discarded[:600] + " ..."
-        logger.info(
-            f"Branch cap for '{term}': kept {MAX_BRANCHES} of {len(sub_triplets)}. "
-            f"Kept: {sub_triplets[:MAX_BRANCHES]}. Discarded tails: {discarded}"
-        )
-        sub_triplets = sub_triplets[:MAX_BRANCHES]
-    if not sub_triplets:
-        logger.debug(f"No sub-triplets extracted from description of '{term}'.")
+    branches, discarded, ranked = branch_selection.select_branches(term, description, sub_triplets, seed_nodes)
+    if sub_triplets:
+        _log_branch_selection(term, len(sub_triplets), branches, discarded, ranked)
+    if not branches:
+        logger.debug(f"No branch selected from the description of '{term}'.")
         return
 
     with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(process_triplet, conn, _get_llm(), st, term, depth + 1, max_depth, current_query_processed_terms, original_response_text): st for st in sub_triplets}
+        futures = {executor.submit(process_triplet, conn, _get_llm(), st, term, depth + 1, max_depth, current_query_processed_terms, original_response_text): st for st in branches}
         for future in as_completed(futures):
             try:
                 future.result()
             except Exception as e:
                 logger.error(f"Error processing sub-triplet derived from '{term}' (Triplet: {futures[future]}): {e}", exc_info=True)
+
+
+def _log_branch_selection(term, extracted, branches, discarded, ranked):
+    """INFO, the whole evidence: what was kept, every eligible candidate with its two keys
+    (E = named entity or literal, then relevance), and what was left out and why. On test_8
+    the old log cut the discarded tails at 600 characters and never named their heads."""
+    kept = "; ".join(_triplet_label(t) for t in branches) or "none"
+    ranking = ", ".join(f"{t['tail']} ({'E' if entity else '-'} {score:.3f})" for t, entity, score in ranked)
+    left_out = "; ".join(f"{_triplet_label(t)} [{reason}]" for t, reason in discarded)
+    logger.info(
+        f"Branch selection for '{term}': kept {len(branches)} of {extracted}: {kept}. "
+        f"Ranked: {ranking or '-'}. Left out: {left_out or '-'}"
+    )
+
+
+def _triplet_label(triplet):
+    return f"{triplet['head']} -{triplet['relation']}-> {triplet['tail']}"
 
 
 def generate_llm_response(user_input):
@@ -503,6 +513,7 @@ def generate_response(user_input, conn, max_depth):
     Tracks processed terms within this specific query execution.
     Passes original response text for context handling.
     """
+    global seed_nodes
     try:
         # Reset Wikipedia-grounding stats for this run
         wiki_stats.reset()
@@ -519,6 +530,9 @@ def generate_response(user_input, conn, max_depth):
         user_input_term = normalize_node_name(user_input)
         save_term_as_node(conn, user_input_term, response) # Save with description from LLM
         current_query_processed_terms.add(user_input_term) # Mark initial term as processed
+        seed_nodes = frozenset({user_input_term} | {
+            normalize_node_name(t[key]) for t in triplets for key in ("head", "tail") if t.get(key)
+        })
         logger.info(f"Saved initial prompt term '{user_input_term}' and added to processed set for this query.")
 
         # --- Timing Start ---

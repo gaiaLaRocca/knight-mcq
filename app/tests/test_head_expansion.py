@@ -60,6 +60,22 @@ class TestAssociationHeadExpansion(unittest.TestCase):
         self.assertEqual(expanded, [])
 
 
+class TestBranchSelectionInTheBuild(unittest.TestCase):
+    def test_only_the_selected_branches_reach_the_graph(self):
+        strauss = [
+            {"head": "joseph strauss", "relation": "designed", "tail": TOPIC},
+            {"head": "charles alton ellis", "relation": "was", "tail": "primary designer"},
+            {"head": "joseph strauss", "relation": "born_in", "tail": "cincinnati"},
+        ]
+        with patch.object(chatbot.branch_selection, "relevance_scorer", lambda tail: 0.0), \
+             patch.object(chatbot, "seed_nodes", frozenset({TOPIC, "joseph strauss", "chief engineer"})), \
+             patch.dict(SUB_TRIPLETS, {"joseph strauss": strauss}):
+            edges, _ = _build([{"head": "joseph strauss", "relation": "served_as", "tail": "chief engineer"}])
+        self.assertIn(("joseph strauss", "BORN_IN", "cincinnati"), edges)
+        self.assertNotIn(("joseph strauss", "DESIGNED", TOPIC), edges)
+        self.assertNotIn(("charles alton ellis", "WAS", "primary designer"), edges)
+
+
 class TestExpandedOnce(unittest.TestCase):
     def test_a_node_reached_as_tail_and_as_head_is_expanded_once(self):
         # test_8: the strait is the tail of `spans` and the head of both `connects` triplets.
