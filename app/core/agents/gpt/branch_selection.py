@@ -39,6 +39,11 @@ def select_branches(node, description, sub_triplets, seed_nodes):
     by a stated relation) and whose tail is neither `node` nor a seed node (an edge to a
     node the seed already reaches doubles paths or ends on a known answer: the strait's
     `connects_to` on test_8). Ranked by entity first, then relevance; one branch per tail.
+    A non-entity never takes a place, so a node with one entity keeps one branch: on test_9
+    the 13 branches given to non-entities kept no question, and four took a wrong page
+    (plan, "No filler branches"). The ranking still lists them, for the log. Without an
+    entity checker nothing but a literal could be an entity, so the free places are filled by
+    relevance as before rather than left empty.
     """
     if relevance_scorer is None:
         return sub_triplets[:MAX_BRANCHES], [(t, "over the cap") for t in sub_triplets[MAX_BRANCHES:]], []
@@ -56,8 +61,10 @@ def select_branches(node, description, sub_triplets, seed_nodes):
     scored.sort(key=lambda entry: (entry[1], entry[2]), reverse=True)
 
     kept, tails_kept = [], set()
-    for triplet, _, _ in scored:
-        if triplet["tail"] in tails_kept:
+    for triplet, entity, _ in scored:
+        if not entity and entity_checker is not None:
+            discarded.append((triplet, "not an entity"))
+        elif triplet["tail"] in tails_kept:
             discarded.append((triplet, "tail already kept"))
         elif len(kept) < MAX_BRANCHES:
             kept.append(triplet)

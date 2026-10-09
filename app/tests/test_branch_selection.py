@@ -67,7 +67,7 @@ class TestRanking(_Injected):
                     _t(NODE, "has_building_by", "frank lloyd wright")]
         kept, discarded, _ = select_branches(NODE, DESCRIPTION, triplets, SEED)
         self.assertEqual([t["tail"] for t in kept], ["san rafael", "frank lloyd wright"])
-        self.assertEqual(discarded, [(triplets[0], "over the cap")])
+        self.assertEqual(discarded, [(triplets[0], "not an entity")])
 
     def test_a_literal_counts_as_an_entity(self):
         triplets = [_t(NODE, "offers", "scenic coastal views"), _t(NODE, "has_population", "262321 residents")]
@@ -75,10 +75,20 @@ class TestRanking(_Injected):
             kept, _, _ = select_branches(NODE, DESCRIPTION, triplets, SEED)
         self.assertEqual(kept[0]["tail"], "262321 residents")
 
-    def test_non_entities_fill_the_free_places(self):
+    def test_a_non_entity_never_takes_a_place(self):
+        # test_9: the strait and Marin filled their free places with pages such as Marin Headlands.
         triplets = [_t(NODE, "has", "natural beauty"), _t(NODE, "offers", "scenic coastal views"),
                     _t(NODE, "has_seat", "san rafael")]
-        kept, _, _ = select_branches(NODE, DESCRIPTION, triplets, SEED)
+        kept, discarded, ranked = select_branches(NODE, DESCRIPTION, triplets, SEED)
+        self.assertEqual([t["tail"] for t in kept], ["san rafael"])
+        self.assertEqual({reason for _, reason in discarded}, {"not an entity"})
+        self.assertEqual(len(ranked), 3)  # still listed, for the log
+
+    def test_without_an_entity_checker_free_places_are_filled_by_relevance(self):
+        triplets = [_t(NODE, "has", "natural beauty"), _t(NODE, "offers", "scenic coastal views"),
+                    _t(NODE, "has_seat", "san rafael")]
+        with patch.object(branch_selection, "entity_checker", None):
+            kept, _, _ = select_branches(NODE, DESCRIPTION, triplets, SEED)
         self.assertEqual([t["tail"] for t in kept], ["san rafael", "scenic coastal views"])
 
     def test_one_branch_per_tail(self):
